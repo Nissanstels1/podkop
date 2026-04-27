@@ -134,10 +134,14 @@ start_main() {
     create_nft_rules
     sing_box_configure_service
 
-    # sing-box
-    sing_box_init_config
+    # cron jobs are installed first so that they survive even if sing-box
+    # config init exits early (e.g. invalid subscription cache). The health
+    # probe is idempotent and harmless when sing-box is down.
     config_foreach add_cron_job "section"
     subscription_install_all_cron_jobs
+
+    # sing-box
+    sing_box_init_config
     /etc/init.d/sing-box start
 
     log "Nice"
