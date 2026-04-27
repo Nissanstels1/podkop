@@ -1,6 +1,7 @@
 "use strict";
 "require form";
 "require baseclass";
+"require fs";
 "require ui";
 "require tools.widgets as widgets";
 "require view.podkop.main as main";
@@ -26,6 +27,7 @@ function createSectionContent(section) {
   o.value("url", _("Connection URL"));
   o.value("selector", _("Selector"));
   o.value("urltest", _("URLTest"));
+  o.value("subscription", _("Subscription"));
   o.value("outbound", _("Outbound Config"));
   o.default = "url";
   o.depends("connection_type", "proxy");
@@ -34,7 +36,7 @@ function createSectionContent(section) {
     form.TextValue,
     "proxy_string",
     _("Proxy Configuration URL"),
-    _("vless://, ss://, trojan://, socks4/5://, hy2/hysteria2:// links")
+    _("vless://, ss://, trojan://, socks4/5://, hy2/hysteria2:// links"),
   );
   o.depends("proxy_config_type", "url");
   o.rows = 5;
@@ -86,7 +88,7 @@ function createSectionContent(section) {
     form.DynamicList,
     "selector_proxy_links",
     _("Selector Proxy Links"),
-    _("vless://, ss://, trojan://, socks4/5://, hy2/hysteria2:// links")
+    _("vless://, ss://, trojan://, socks4/5://, hy2/hysteria2:// links"),
   );
   o.depends("proxy_config_type", "selector");
   o.rmempty = false;
@@ -109,7 +111,7 @@ function createSectionContent(section) {
     form.DynamicList,
     "urltest_proxy_links",
     _("URLTest Proxy Links"),
-    _("vless://, ss://, trojan://, socks4/5://, hy2/hysteria2:// links")
+    _("vless://, ss://, trojan://, socks4/5://, hy2/hysteria2:// links"),
   );
   o.depends("proxy_config_type", "urltest");
   o.rmempty = false;
@@ -132,7 +134,7 @@ function createSectionContent(section) {
     form.ListValue,
     "urltest_check_interval",
     _("URLTest Check Interval"),
-    _("The interval between connectivity tests")
+    _("The interval between connectivity tests"),
   );
   o.value("30s", _("Every 30 seconds"));
   o.value("1m", _("Every 1 minute"));
@@ -140,16 +142,20 @@ function createSectionContent(section) {
   o.value("5m", _("Every 5 minutes"));
   o.default = "3m";
   o.depends("proxy_config_type", "urltest");
+  o.depends("proxy_config_type", "subscription");
 
   o = section.option(
     form.Value,
     "urltest_tolerance",
     _("URLTest Tolerance"),
-    _("The maximum difference in response times (ms) allowed when comparing servers")
+    _(
+      "The maximum difference in response times (ms) allowed when comparing servers",
+    ),
   );
   o.default = "50";
   o.rmempty = false;
   o.depends("proxy_config_type", "urltest");
+  o.depends("proxy_config_type", "subscription");
   o.validate = function (section_id, value) {
     if (!value || value.length === 0) {
       return true;
@@ -157,26 +163,42 @@ function createSectionContent(section) {
 
     const parsed = parseFloat(value);
 
-    if (/^[0-9]+$/.test(value) && !isNaN(parsed) && isFinite(parsed) && parsed >= 50 && parsed <= 1000) {
+    if (
+      /^[0-9]+$/.test(value) &&
+      !isNaN(parsed) &&
+      isFinite(parsed) &&
+      parsed >= 50 &&
+      parsed <= 1000
+    ) {
       return true;
     }
 
-    return _('Must be a number in the range of 50 - 1000');
+    return _("Must be a number in the range of 50 - 1000");
   };
 
   o = section.option(
     form.Value,
     "urltest_testing_url",
     _("URLTest Testing URL"),
-    _("The URL used to test server connectivity")
+    _("The URL used to test server connectivity"),
   );
-  o.value("https://www.gstatic.com/generate_204", "https://www.gstatic.com/generate_204 (Google)");
-  o.value("https://cp.cloudflare.com/generate_204", "https://cp.cloudflare.com/generate_204 (Cloudflare)");
+  o.value(
+    "https://www.gstatic.com/generate_204",
+    "https://www.gstatic.com/generate_204 (Google)",
+  );
+  o.value(
+    "https://cp.cloudflare.com/generate_204",
+    "https://cp.cloudflare.com/generate_204 (Cloudflare)",
+  );
   o.value("https://captive.apple.com", "https://captive.apple.com (Apple)");
-  o.value("https://connectivity-check.ubuntu.com", "https://connectivity-check.ubuntu.com (Ubuntu)")
+  o.value(
+    "https://connectivity-check.ubuntu.com",
+    "https://connectivity-check.ubuntu.com (Ubuntu)",
+  );
   o.default = "https://www.gstatic.com/generate_204";
   o.rmempty = false;
   o.depends("proxy_config_type", "urltest");
+  o.depends("proxy_config_type", "subscription");
 
   o.validate = function (section_id, value) {
     if (!value || value.length === 0) {
@@ -191,6 +213,286 @@ function createSectionContent(section) {
 
     return validation.message;
   };
+
+  // ---------- Subscription ----------------------------------------------
+
+  o = section.option(
+    form.Value,
+    "subscription_url",
+    _("Subscription URL"),
+    _(
+      "HTTP(S) URL of a Marzban/Remna sing-box JSON subscription, or a base64-encoded list of proxy URIs (vless://, ss://, etc.).",
+    ),
+  );
+  o.depends("proxy_config_type", "subscription");
+  o.rmempty = false;
+  o.password = true;
+  o.validate = function (section_id, value) {
+    if (!value || value.length === 0) {
+      return _("Subscription URL is required");
+    }
+    const v = main.validateUrl(value);
+    return v.valid ? true : v.message;
+  };
+
+  o = section.option(
+    form.ListValue,
+    "subscription_format",
+    _("Subscription Format"),
+    _(
+      "How to interpret the subscription body. 'auto' detects sing-box JSON vs base64 vs plain link list automatically.",
+    ),
+  );
+  o.value("auto", _("Auto-detect"));
+  o.value("sing-box", _("sing-box JSON outbounds"));
+  o.value("base64", _("Base64 list of links"));
+  o.value("plain", _("Plain list of links"));
+  o.default = "auto";
+  o.depends("proxy_config_type", "subscription");
+
+  o = section.option(
+    form.Value,
+    "subscription_user_agent",
+    _("User-Agent"),
+    _(
+      "Some panels return different formats depending on the User-Agent. 'auto' picks SFA/1.11.9 for sing-box format, 'podkop' otherwise. Override with any string if your panel needs a specific UA.",
+    ),
+  );
+  o.value("auto", _("Auto"));
+  o.value("SFA/1.11.9", "SFA/1.11.9 (sing-box)");
+  o.value("podkop", "podkop");
+  o.value("clash.meta", "clash.meta");
+  o.default = "auto";
+  o.depends("proxy_config_type", "subscription");
+
+  o = section.option(
+    form.ListValue,
+    "subscription_mode",
+    _("Selection Mode"),
+    _(
+      "URLTest: sing-box pings every server periodically and routes via the fastest one (recommended). Selector: defaults to the first matched server; switch via Clash dashboard.",
+    ),
+  );
+  o.value("urltest", _("URLTest (auto-best by latency)"));
+  o.value("selector", _("Selector (manual)"));
+  o.default = "urltest";
+  o.depends("proxy_config_type", "subscription");
+
+  o = section.option(
+    form.DynamicList,
+    "subscription_filters",
+    _("Tag Filters (include)"),
+    _(
+      "Substring filters applied to the proxy tag/name. Use '|' inside one row for OR (e.g. 'NL|DE|FI' or '🇩🇪|🇳🇱'). Multiple rows are also OR'd. Leave empty to include every profile.",
+    ),
+  );
+  o.depends("proxy_config_type", "subscription");
+  o.placeholder = "NL|DE|FI";
+
+  o = section.option(
+    form.DynamicList,
+    "subscription_exclude",
+    _("Tag Filters (exclude)"),
+    _(
+      "Drop any profile whose tag matches any of these substrings. Same OR-with-'|' syntax as above.",
+    ),
+  );
+  o.depends("proxy_config_type", "subscription");
+  o.placeholder = "expired|trial";
+
+  o = section.option(
+    form.ListValue,
+    "subscription_update_interval",
+    _("Auto-update Interval"),
+    _(
+      "How often the subscription is refreshed in the background. On every successful refresh sing-box is reloaded.",
+    ),
+  );
+  o.value("10m", _("Every 10 minutes"));
+  o.value("1h", _("Every hour"));
+  o.value("6h", _("Every 6 hours"));
+  o.value("1d", _("Once a day"));
+  o.value("off", _("Disabled (manual only)"));
+  o.default = "1h";
+  o.depends("proxy_config_type", "subscription");
+
+  o = section.option(
+    form.Flag,
+    "subscription_allow_insecure",
+    _("Allow Insecure TLS"),
+    _(
+      "Accept self-signed / expired TLS certificates when fetching the subscription. Only enable if you trust the endpoint.",
+    ),
+  );
+  o.default = "0";
+  o.rmempty = false;
+  o.depends("proxy_config_type", "subscription");
+
+  // Manual update + profiles browser.
+  o = section.option(
+    form.Button,
+    "_subscription_update_button",
+    _("Update subscription now"),
+    _("Refresh the subscription cache and reload sing-box."),
+  );
+  o.depends("proxy_config_type", "subscription");
+  o.inputstyle = "apply";
+  o.onclick = function (ev, section_id) {
+    const btn = ev.currentTarget;
+    btn.disabled = true;
+    btn.innerHTML = _("Updating…");
+    return fs
+      .exec("/usr/bin/podkop", ["subscription_update", section_id])
+      .then(function (res) {
+        if (res.code === 0) {
+          ui.addNotification(
+            null,
+            E(
+              "p",
+              {},
+              _("Subscription '%s' updated successfully.").format(section_id),
+            ),
+            "info",
+          );
+        } else {
+          ui.addNotification(
+            null,
+            E(
+              "p",
+              {},
+              _(
+                "Subscription '%s' update failed (exit=%d). See system log.",
+              ).format(section_id, res.code || -1),
+            ),
+            "danger",
+          );
+        }
+      })
+      .catch(function (err) {
+        ui.addNotification(
+          null,
+          E("p", {}, _("Error: %s").format(err.message || err)),
+          "danger",
+        );
+      })
+      .finally(function () {
+        btn.disabled = false;
+        btn.innerHTML = _("Update subscription now");
+      });
+  };
+
+  o = section.option(
+    form.Button,
+    "_subscription_show_button",
+    _("Show parsed profiles"),
+    _(
+      "Open a list of all profiles parsed from the subscription, with a checkmark next to the ones that pass the current filter.",
+    ),
+  );
+  o.depends("proxy_config_type", "subscription");
+  o.inputstyle = "action";
+  o.onclick = function (ev, section_id) {
+    return Promise.all([
+      fs.exec("/usr/bin/podkop", ["subscription_status", section_id]),
+      fs.exec("/usr/bin/podkop", ["subscription_list", section_id]),
+    ])
+      .then(function (results) {
+        const status = JSON.parse(results[0].stdout || "{}");
+        const list = JSON.parse(results[1].stdout || "[]");
+
+        const lastUpdate = status.last_update
+          ? new Date(status.last_update * 1000).toLocaleString()
+          : _("never");
+
+        const rows = list.map(function (it) {
+          return E("tr", { class: "tr" }, [
+            E(
+              "td",
+              { class: "td", style: "text-align:center" },
+              it.matched ? "✓" : "",
+            ),
+            E(
+              "td",
+              { class: "td", style: "font-family:monospace" },
+              it.tag || "-",
+            ),
+            E(
+              "td",
+              { class: "td" },
+              it.kind === "json" ? it.type || "json" : "url",
+            ),
+            E(
+              "td",
+              { class: "td", style: "font-family:monospace" },
+              it.endpoint || "-",
+            ),
+          ]);
+        });
+
+        const table = E(
+          "table",
+          { class: "table" },
+          [
+            E("tr", { class: "tr table-titles" }, [
+              E("th", { class: "th" }, _("Match")),
+              E("th", { class: "th" }, _("Tag")),
+              E("th", { class: "th" }, _("Type")),
+              E("th", { class: "th" }, _("Endpoint")),
+            ]),
+          ].concat(rows),
+        );
+
+        ui.showModal(_("Subscription profiles — %s").format(section_id), [
+          E("p", {}, [
+            E("strong", {}, _("Status:") + " "),
+            status.status || "-",
+            " · ",
+            E("strong", {}, _("Format:") + " "),
+            status.format || "-",
+            " · ",
+            E("strong", {}, _("Last update:") + " "),
+            lastUpdate,
+            " · ",
+            E("strong", {}, _("Filtered:") + " "),
+            String(status.filtered || 0),
+            " / ",
+            String(status.total || 0),
+          ]),
+          rows.length === 0
+            ? E(
+                "p",
+                { class: "alert-message warning" },
+                _(
+                  "No profiles parsed yet. Click 'Update subscription now' first.",
+                ),
+              )
+            : table,
+          E("div", { class: "right" }, [
+            E(
+              "button",
+              {
+                class: "btn",
+                click: ui.hideModal,
+              },
+              _("Close"),
+            ),
+          ]),
+        ]);
+      })
+      .catch(function (err) {
+        ui.addNotification(
+          null,
+          E(
+            "p",
+            {},
+            _("Failed to load profiles: %s").format(err.message || err),
+          ),
+          "danger",
+        );
+      });
+  };
+
+  // ---------- /Subscription ---------------------------------------------
 
   o = section.option(
     form.Flag,
@@ -504,8 +806,7 @@ function createSectionContent(section) {
     "user_subnets_text",
     _("User Subnets List"),
     _(
-      "Enter subnets in CIDR notation or single IP addresses, separated by commas, spaces, or newlines. " +
-        "You can add comments using //",
+      "Enter subnets in CIDR notation or single IP addresses, separated by commas, spaces, or newlines. You can add comments using //",
     ),
   );
   o.placeholder =
@@ -677,8 +978,7 @@ function createSectionContent(section) {
     "mixed_proxy_port",
     _("Mixed Proxy Port"),
     _(
-      "Specify the port number on which the mixed proxy will run for this section. " +
-        "Make sure the selected port is not used by another service",
+      "Specify the port number on which the mixed proxy will run for this section. Make sure the selected port is not used by another service",
     ),
   );
   o.rmempty = false;
