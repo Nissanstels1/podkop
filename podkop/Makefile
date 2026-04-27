@@ -52,6 +52,8 @@ define Package/podkop/install
 	$(INSTALL_DIR) $(1)/etc/config
 	$(INSTALL_CONF) ./files/etc/config/podkop $(1)/etc/config/podkop
 
+	$(INSTALL_DIR) $(1)/etc/podkop/subscriptions
+
 	$(INSTALL_DIR) $(1)/usr/bin
 	$(INSTALL_BIN) ./files/usr/bin/podkop $(1)/usr/bin/podkop
 
