@@ -284,6 +284,28 @@ nft_init_interfaces_set() {
     done
 }
 
+# Returns 0 if either the global setting `enable_kill_switch` is true or any
+# section has its own `enable_kill_switch` flag set.
+has_kill_switch_enabled() {
+    local global_flag enabled
+    config_get_bool global_flag "settings" "enable_kill_switch" 0
+    if [ "$global_flag" -eq 1 ]; then
+        return 0
+    fi
+
+    enabled=0
+    _ks_check() {
+        local section="$1"
+        local v
+        config_get_bool v "$section" "enable_kill_switch" 0
+        [ "$v" -eq 1 ] && enabled=1
+    }
+    config_foreach _ks_check "section"
+
+    [ "$enabled" -eq 1 ] && return 0
+    return 1
+}
+
 create_nft_rules() {
     log "Create nft table"
     nft_create_table "$NFT_TABLE_NAME"
@@ -324,6 +346,17 @@ create_nft_rules() {
 
     nft add rule inet "$NFT_TABLE_NAME" proxy meta mark \& "$NFT_FAKEIP_MARK" == "$NFT_FAKEIP_MARK" meta l4proto tcp tproxy ip to 127.0.0.1:1602 counter
     nft add rule inet "$NFT_TABLE_NAME" proxy meta mark \& "$NFT_FAKEIP_MARK" == "$NFT_FAKEIP_MARK" meta l4proto udp tproxy ip to 127.0.0.1:1602 counter
+
+    # Kill-switch: when enabled, drop any marked packet that fell through the
+    # tproxy redirect (i.e. sing-box is down or its tproxy listener is gone).
+    # This prevents traffic that was selected for proxying from leaking through
+    # the default route while the proxy is unavailable.
+    if has_kill_switch_enabled; then
+        log "Kill-switch enabled: blocking marked traffic that bypasses sing-box"
+        nft add rule inet "$NFT_TABLE_NAME" proxy \
+            meta mark \& "$NFT_FAKEIP_MARK" == "$NFT_FAKEIP_MARK" \
+            counter drop comment '"podkop-killswitch-drop"'
+    fi
 
     nft add rule inet "$NFT_TABLE_NAME" mangle_output ip daddr "@$NFT_LOCALV4_SET_NAME" return
     nft add rule inet "$NFT_TABLE_NAME" mangle_output meta mark "$NFT_OUTBOUND_MARK" counter return
@@ -492,7 +525,9 @@ subscription_remove_cron_jobs() {
         (crontab -l 2>/dev/null | grep -v "# podkop-subscription:$section_filter\$") | crontab -
         log "Subscription cron job removed for section '$section_filter'"
     else
-        (crontab -l 2>/dev/null | grep -v "# podkop-subscription:") | crontab -
+        (crontab -l 2>/dev/null \
+            | grep -v "# podkop-subscription:" \
+            | grep -v "# podkop-subscription-health\$") | crontab -
         log "All subscription cron jobs removed"
     fi
 }
@@ -533,6 +568,38 @@ subscription_add_cron_job() {
 
 subscription_install_all_cron_jobs() {
     config_foreach subscription_add_cron_job "section"
+    subscription_install_health_cron_job
+}
+
+# Install a single cron entry that probes every section's filtered profiles
+# every five minutes for adaptive rotation. Idempotent.
+subscription_install_health_cron_job() {
+    local cron_line existing any
+    any=0
+    _check_section_has_sub() {
+        local section="$1"
+        local url
+        config_get url "$section" "subscription_url"
+        [ -n "$url" ] && any=1
+    }
+    config_foreach _check_section_has_sub "section"
+
+    if [ "$any" -eq 0 ]; then
+        # Remove any leftover marker if no section uses subscriptions any more.
+        (crontab -l 2>/dev/null | grep -v "# podkop-subscription-health\$") | crontab -
+        return 0
+    fi
+
+    cron_line="*/5 * * * * /usr/bin/podkop subscription_health # podkop-subscription-health"
+
+    existing="$(crontab -l 2>/dev/null | grep "# podkop-subscription-health\$")"
+    if [ "$existing" = "$cron_line" ]; then
+        log "subscription health cron already up to date" "debug"
+        return 0
+    fi
+
+    (crontab -l 2>/dev/null | grep -v "# podkop-subscription-health\$"; echo "$cron_line") | crontab -
+    log "subscription health cron installed (every 5 minutes)"
 }
 
 list_update() {
@@ -795,9 +862,13 @@ configure_outbound_handler() {
                     log "subscription[$section]: initial update failed, will reuse old cache if any" "warn"
             fi
 
+            local subscription_drop_stuck
+            config_get subscription_drop_stuck "$section" "subscription_drop_stuck" "0"
+
             i=1
             outbound_tags=""
             filtered_count=0
+            local skipped_stuck=0
             # Use a temp file because we need to consume the filtered list line-by-line.
             local _sub_tmp
             _sub_tmp="$(mktemp)"
@@ -807,6 +878,16 @@ configure_outbound_handler() {
                 kind="${line%% *}"
                 rest="${line#"$kind "}"
                 tag_for_outbound="$section-$i"
+
+                # Adaptive rotation: optionally skip tags currently flagged as stuck.
+                if [ "$subscription_drop_stuck" = "1" ] && \
+                    subscription_tag_is_stuck "$section" "$tag_for_outbound"; then
+                    log "subscription[$section]: skipping stuck tag $tag_for_outbound" "info"
+                    skipped_stuck=$((skipped_stuck + 1))
+                    i=$((i + 1))
+                    continue
+                fi
+
                 case "$kind" in
                     url)
                         config="$(sing_box_cf_add_proxy_outbound "$config" "$tag_for_outbound" "$rest" "$udp_over_tcp")"
@@ -831,7 +912,11 @@ configure_outbound_handler() {
             rm -f "$_sub_tmp"
 
             if [ "$filtered_count" -eq 0 ]; then
-                log "subscription[$section]: no profiles after filter — section will be inactive. Adjust subscription_filters or run 'podkop subscription_update $section'." "error"
+                if [ "$skipped_stuck" -gt 0 ]; then
+                    log "subscription[$section]: every profile is currently in the stuck list ($skipped_stuck) — section will be inactive. Run 'podkop subscription_health $section' or wait for auto-recovery." "error"
+                else
+                    log "subscription[$section]: no profiles after filter — section will be inactive. Adjust subscription_filters or run 'podkop subscription_update $section'." "error"
+                fi
                 # Skip wiring outbounds for this section; rest of config can still build.
                 return 0
             fi
@@ -842,8 +927,11 @@ configure_outbound_handler() {
             selector_outbounds="$(comma_string_to_json_array "$outbound_tags,$urltest_tag")"
 
             # Always create a urltest group — sing-box does the PING + auto-best-pick.
+            # interrupt_exist_connections=true so failover to a different server
+            # cuts existing TCP/UDP sessions instead of letting them stick to a
+            # newly-degraded node ("adaptive rotation").
             config="$(sing_box_cm_add_urltest_outbound "$config" "$urltest_tag" "$urltest_outbounds" \
-                "$urltest_testing_url" "$urltest_check_interval" "$urltest_tolerance")"
+                "$urltest_testing_url" "$urltest_check_interval" "$urltest_tolerance" "" "true")"
 
             # Wrap in a selector so that the user can override via Clash API/Dashboard.
             # Default = urltest in "urltest" mode, first profile in "selector" mode.
@@ -856,7 +944,7 @@ configure_outbound_handler() {
                     default_outbound="$urltest_tag"
                     ;;
             esac
-            config="$(sing_box_cm_add_selector_outbound "$config" "$selector_tag" "$selector_outbounds" "$default_outbound")"
+            config="$(sing_box_cm_add_selector_outbound "$config" "$selector_tag" "$selector_outbounds" "$default_outbound" "true")"
             ;;
         *)
             log "Unknown proxy configuration type: '$proxy_config_type'. Aborted." "fatal"
@@ -2799,14 +2887,25 @@ global_check() {
 }
 
 subscription_update_cli() {
-    local target="$1"
+    # Accepts: <section> [--no-reload]
+    local target=""
+    local no_reload=0
     local rc=0 any=0
+    local arg
+
+    for arg in "$@"; do
+        case "$arg" in
+            --no-reload) no_reload=1 ;;
+            -*)          : ;;  # ignore other flags for forward-compat
+            "")          : ;;
+            *)           target="$arg" ;;
+        esac
+    done
 
     if [ -n "$target" ]; then
         subscription_update_section "$target"
         rc=$?
-        # Reload sing-box so the new outbound list takes effect.
-        if [ "$rc" -eq 0 ]; then
+        if [ "$rc" -eq 0 ] && [ "$no_reload" -eq 0 ]; then
             log "subscription[$target]: reloading sing-box"
             reload >/dev/null 2>&1 || /etc/init.d/sing-box reload >/dev/null 2>&1 || true
         fi
@@ -2824,11 +2923,45 @@ subscription_update_cli() {
     }
     config_foreach _do_one "section"
 
-    if [ "$any" -eq 1 ] && [ "$rc" -eq 0 ]; then
+    if [ "$any" -eq 1 ] && [ "$rc" -eq 0 ] && [ "$no_reload" -eq 0 ]; then
         log "subscription: reloading sing-box"
         reload >/dev/null 2>&1 || /etc/init.d/sing-box reload >/dev/null 2>&1 || true
     fi
     return "$rc"
+}
+
+# Apply phase: just reload sing-box. Split out so the LuCI button can run
+# fetch+parse synchronously (fast) and reload asynchronously (slow).
+subscription_apply_cli() {
+    log "subscription: applying (reload sing-box)"
+    reload >/dev/null 2>&1 || /etc/init.d/sing-box reload >/dev/null 2>&1 || true
+    return 0
+}
+
+subscription_health_cli() {
+    local target="$1"
+    if [ -n "$target" ]; then
+        subscription_health_check "$target"
+        return $?
+    fi
+    _hc_one() {
+        local section="$1"
+        local url
+        config_get url "$section" "subscription_url"
+        [ -z "$url" ] && return 0
+        subscription_health_check "$section" || true
+    }
+    config_foreach _hc_one "section"
+    return 0
+}
+
+subscription_stuck_cli() {
+    local target="$1"
+    if [ -z "$target" ]; then
+        echo "Usage: $0 subscription_stuck <section>" >&2
+        return 2
+    fi
+    subscription_stuck_json "$target"
 }
 
 subscription_status_cli() {
@@ -2880,16 +3013,29 @@ Available commands:
     restart                 Restart podkop service
     main                    Run main podkop process
     list_update             Update domain lists
-    subscription_update [section]
+    subscription_update [section] [--no-reload]
                             Refresh subscription cache (cron-friendly).
                             Without an argument refreshes every section that
                             has subscription_url set, then reloads sing-box.
+                            With --no-reload only updates the cache.
+    subscription_apply      Reload sing-box so the latest cache takes effect.
+                            Used by the LuCI 'Update subscription now' button
+                            to keep the request short and responsive.
     subscription_status [section]
                             Print JSON status (last_update, total, filtered,
-                            format, status) for one or all sections.
+                            format, status, sha256, fallback_in_use, stuck)
+                            for one or all sections.
     subscription_list <section>
                             Print JSON array of all parsed profiles for the
                             given section, with a 'matched' flag per row.
+    subscription_health [section]
+                            Probe each filtered profile through the local
+                            Clash API (delay endpoint) and update the
+                            stuck-server tracker. Run from cron every few
+                            minutes for adaptive rotation.
+    subscription_stuck <section>
+                            Print JSON array of currently-stuck profile tags
+                            for the given section.
     check_proxy             Check proxy connectivity
     check_nft               Check NFT rules
     check_nft_rules         Check NFT rules status
@@ -2931,13 +3077,23 @@ list_update)
     list_update
     ;;
 subscription_update)
-    subscription_update_cli "$2"
+    shift
+    subscription_update_cli "$@"
+    ;;
+subscription_apply)
+    subscription_apply_cli
+    ;;
+subscription_health)
+    subscription_health_cli "$2"
     ;;
 subscription_status)
     subscription_status_cli "$2"
     ;;
 subscription_list)
     subscription_list_cli "$2"
+    ;;
+subscription_stuck)
+    subscription_stuck_cli "$2"
     ;;
 check_proxy)
     check_proxy

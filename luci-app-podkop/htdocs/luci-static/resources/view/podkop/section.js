@@ -236,6 +236,23 @@ function createSectionContent(section) {
   };
 
   o = section.option(
+    form.DynamicList,
+    "subscription_url_fallback",
+    _("Fallback Subscription URLs"),
+    _(
+      "Optional. Tried in order if the primary URL is unreachable or returns a non-2xx status. Useful when your panel has a mirror.",
+    ),
+  );
+  o.depends("proxy_config_type", "subscription");
+  o.password = true;
+  o.placeholder = "https://mirror.example.com/abcdef";
+  o.validate = function (section_id, value) {
+    if (!value || value.length === 0) return true;
+    const v = main.validateUrl(value);
+    return v.valid ? true : v.message;
+  };
+
+  o = section.option(
     form.ListValue,
     "subscription_format",
     _("Subscription Format"),
@@ -328,33 +345,59 @@ function createSectionContent(section) {
   o.rmempty = false;
   o.depends("proxy_config_type", "subscription");
 
+  o = section.option(
+    form.Flag,
+    "subscription_drop_stuck",
+    _("Adaptive rotation"),
+    _(
+      "When enabled, profiles whose Clash-API delay probes have failed three times in a row are excluded from the URLTest pool. They are auto-restored after 30 minutes or as soon as a probe succeeds again. Helps when a server pings fine but does not actually proxy traffic.",
+    ),
+  );
+  o.default = "0";
+  o.rmempty = false;
+  o.depends("proxy_config_type", "subscription");
+
+  o = section.option(
+    form.Flag,
+    "enable_kill_switch",
+    _("Kill-switch"),
+    _(
+      "When enabled, traffic that the firewall has marked for proxying is dropped instead of leaking through the default route while sing-box is unreachable. Affects all sections (global). Recommended for privacy-sensitive setups.",
+    ),
+  );
+  o.default = "0";
+  o.rmempty = false;
+  o.depends("proxy_config_type", "subscription");
+
   // Manual update + profiles browser.
   o = section.option(
     form.Button,
     "_subscription_update_button",
     _("Update subscription now"),
-    _("Refresh the subscription cache and reload sing-box."),
+    _(
+      "Refresh the subscription cache. The fetch+parse step is fast (~5s); reloading sing-box happens in the background so the LuCI request never times out.",
+    ),
   );
   o.depends("proxy_config_type", "subscription");
   o.inputstyle = "apply";
   o.onclick = function (ev, section_id) {
     const btn = ev.currentTarget;
+    const restoreBtn = function () {
+      btn.disabled = false;
+      btn.innerHTML = _("Update subscription now");
+    };
     btn.disabled = true;
-    btn.innerHTML = _("Updating…");
+    btn.innerHTML = _("Fetching…");
+
+    // Step 1: synchronous fetch + parse + cache rotation. Returns quickly.
     return fs
-      .exec("/usr/bin/podkop", ["subscription_update", section_id])
+      .exec("/usr/bin/podkop", [
+        "subscription_update",
+        section_id,
+        "--no-reload",
+      ])
       .then(function (res) {
-        if (res.code === 0) {
-          ui.addNotification(
-            null,
-            E(
-              "p",
-              {},
-              _("Subscription '%s' updated successfully.").format(section_id),
-            ),
-            "info",
-          );
-        } else {
+        if (res.code !== 0) {
           ui.addNotification(
             null,
             E(
@@ -366,7 +409,34 @@ function createSectionContent(section) {
             ),
             "danger",
           );
+          return;
         }
+
+        ui.addNotification(
+          null,
+          E(
+            "p",
+            {},
+            _(
+              "Subscription '%s' updated successfully. Reloading sing-box in the background…",
+            ).format(section_id),
+          ),
+          "info",
+        );
+
+        // Step 2: trigger reload asynchronously (fire-and-forget). The shell
+        // background-detaches sing-box reload so this fs.exec returns in
+        // milliseconds even if reload itself takes 30-60s.
+        return fs
+          .exec("/bin/sh", [
+            "-c",
+            "nohup /usr/bin/podkop subscription_apply >/dev/null 2>&1 &",
+          ])
+          .catch(function () {
+            // Last-resort: synchronous apply (still bounded since sing-box
+            // reload typically completes well within fs.exec's timeout).
+            return fs.exec("/usr/bin/podkop", ["subscription_apply"]);
+          });
       })
       .catch(function (err) {
         ui.addNotification(
@@ -375,10 +445,7 @@ function createSectionContent(section) {
           "danger",
         );
       })
-      .finally(function () {
-        btn.disabled = false;
-        btn.innerHTML = _("Update subscription now");
-      });
+      .finally(restoreBtn);
   };
 
   o = section.option(
@@ -442,22 +509,52 @@ function createSectionContent(section) {
           ].concat(rows),
         );
 
+        const headerChildren = [
+          E("strong", {}, _("Status:") + " "),
+          status.status || "-",
+          " · ",
+          E("strong", {}, _("Format:") + " "),
+          status.format || "-",
+          " · ",
+          E("strong", {}, _("Last update:") + " "),
+          lastUpdate,
+          " · ",
+          E("strong", {}, _("Filtered:") + " "),
+          String(status.filtered || 0),
+          " / ",
+          String(status.total || 0),
+        ];
+        if (status.fallback_in_use) {
+          headerChildren.push(
+            " · ",
+            E(
+              "span",
+              {
+                class: "label",
+                style:
+                  "background:#d9534f;color:#fff;padding:2px 6px;border-radius:3px;",
+              },
+              _("Cache fallback"),
+            ),
+          );
+        }
+        if (status.stuck && status.stuck > 0) {
+          headerChildren.push(
+            " · ",
+            E(
+              "span",
+              {
+                class: "label",
+                style:
+                  "background:#f0ad4e;color:#fff;padding:2px 6px;border-radius:3px;",
+              },
+              _("Stuck servers: %d").format(status.stuck),
+            ),
+          );
+        }
+
         ui.showModal(_("Subscription profiles — %s").format(section_id), [
-          E("p", {}, [
-            E("strong", {}, _("Status:") + " "),
-            status.status || "-",
-            " · ",
-            E("strong", {}, _("Format:") + " "),
-            status.format || "-",
-            " · ",
-            E("strong", {}, _("Last update:") + " "),
-            lastUpdate,
-            " · ",
-            E("strong", {}, _("Filtered:") + " "),
-            String(status.filtered || 0),
-            " / ",
-            String(status.total || 0),
-          ]),
+          E("p", {}, headerChildren),
           rows.length === 0
             ? E(
                 "p",
