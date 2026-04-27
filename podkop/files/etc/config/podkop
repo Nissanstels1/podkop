@@ -38,3 +38,17 @@ config section 'main'
         #list fully_routed_ips '192.168.1.2'
         #option mixed_proxy_enabled '1'
         #option mixed_proxy_port '2080'
+        # --- Subscription mode example -------------------------------------
+        # To use a subscription URL instead of a single proxy_string, set:
+        #   option proxy_config_type 'subscription'
+        #   option subscription_url 'https://sub.example.com/abcdef'
+        #   option subscription_format 'auto'             # auto|sing-box|base64|plain
+        #   option subscription_user_agent 'auto'         # auto|sing-box|podkop|<custom>
+        #   option subscription_mode 'urltest'            # urltest|selector
+        #   option subscription_update_interval '1h'      # 10m|1h|6h|1d|off
+        #   option subscription_allow_insecure '0'
+        #   list   subscription_filters 'NL|DE|FI'        # OR within row, OR across rows
+        #   list   subscription_exclude  'expired'
+        #   option urltest_check_interval '3m'
+        #   option urltest_tolerance '50'
+        #   option urltest_testing_url 'https://www.gstatic.com/generate_204'
