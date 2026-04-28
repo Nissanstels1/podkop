@@ -132,11 +132,12 @@ subscription_fetch() {
     fi
 
     # -fsSL: fail on HTTP errors, silent, follow redirects.
-    # 30s connect, 60s total — subscription endpoints are usually slow.
+    # Timeouts must fit under LuCI's 30s XHR ceiling: with up to 3 URLs in
+    # fallback chain, each curl is bounded so total worst-case stays <30s.
     # shellcheck disable=SC2086
     curl -fsSL $extra \
-        --connect-timeout 30 \
-        --max-time 60 \
+        --connect-timeout 5 \
+        --max-time 8 \
         -A "$ua" \
         "$url"
 }
