@@ -1040,7 +1040,7 @@ subscription_test_url_json() {
     # %{time_total}   = end-to-end.
     local out rc
     # shellcheck disable=SC2086
-    out="$(curl -sS $extra --connect-timeout 8 --max-time 15 -o /dev/null \
+    out="$(curl -sS $extra --connect-timeout 5 --max-time 8 -o /dev/null \
         -w 'http_code=%{http_code}\nsize=%{size_download}\nct=%{content_type}\nrip=%{remote_ip}\ntc=%{time_connect}\ntac=%{time_appconnect}\ntt=%{time_total}\n' \
         -I -A "$ua" "$url" 2>/dev/null)"
     rc=$?
@@ -1064,7 +1064,7 @@ subscription_test_url_json() {
     # (subscription_test_url_json must always emit a JSON object).
     local sample format_guess="unknown"
     # shellcheck disable=SC2086
-    sample="$(curl -fsS $extra --max-time 15 \
+    sample="$(curl -fsS $extra --connect-timeout 5 --max-time 8 \
         -A "$ua" \
         --range 0-8192 \
         "$url" 2>/dev/null || true)"
@@ -1156,8 +1156,20 @@ subscription_validate_json() {
     }
 
     # Stage 1 — DNS
+    # If the host part already looks like a literal IPv4/IPv6 address, skip
+    # the resolver (BusyBox `nslookup` returns nothing for raw IPs and
+    # `getent` is rarely installed on OpenWrt routers).
     local ip
-    if command -v getent >/dev/null 2>&1; then
+    case "$host" in
+        # Trivially-IPv4 (4 dotted octets — exact match isn't needed, the
+        # /[0-9.]+/ test is enough to short-circuit valid raw addresses).
+        *[!0-9.]*) ;;
+        *.*.*.*)   ip="$host" ;;
+    esac
+    case "$host" in
+        *:*) ip="$host" ;;  # IPv6 literal
+    esac
+    if [ -z "$ip" ] && command -v getent >/dev/null 2>&1; then
         ip="$(getent hosts "$host" 2>/dev/null | awk 'NR==1{print $1}')"
     fi
     if [ -z "$ip" ] && command -v nslookup >/dev/null 2>&1; then
@@ -1172,7 +1184,11 @@ subscription_validate_json() {
                 }')"
     fi
     if [ -n "$ip" ]; then
-        _vc_add "dns" "true"  "$host → $ip"
+        if [ "$ip" = "$host" ]; then
+            _vc_add "dns" "true" "Literal IP — skipped"
+        else
+            _vc_add "dns" "true"  "$host → $ip"
+        fi
     else
         _vc_add "dns" "false" "Cannot resolve $host"
         _vc_emit
@@ -1184,7 +1200,7 @@ subscription_validate_json() {
     [ "$allow_insecure" = "1" ] && extra="-k"
     local out rc tc tac http_code
     # shellcheck disable=SC2086
-    out="$(curl -sS $extra --connect-timeout 8 --max-time 15 -o /dev/null \
+    out="$(curl -sS $extra --connect-timeout 5 --max-time 8 -o /dev/null \
         -w 'tc=%{time_connect}\ntac=%{time_appconnect}\ncode=%{http_code}\n' \
         -I -A "$ua" "$url" 2>/dev/null)"
     rc=$?
@@ -1231,7 +1247,7 @@ subscription_validate_json() {
     # Stage 5+6 — fetch full body, detect format, parse
     local body actual_format count parsed_tmp
     # shellcheck disable=SC2086
-    body="$(curl -fsS $extra --max-time 30 -A "$ua" "$url" 2>/dev/null)"
+    body="$(curl -fsS $extra --connect-timeout 5 --max-time 12 -A "$ua" "$url" 2>/dev/null)"
     if [ -z "$body" ]; then
         _vc_add "format" "false" "Empty response body"
         _vc_emit
