@@ -3049,6 +3049,17 @@ subscription_latency_cli() {
     subscription_latency_json "$target" "$force"
 }
 
+# Currently active (URLTest-selected) outbound for a section.
+# Args: <section>
+subscription_active_cli() {
+    local target="$1"
+    if [ -z "$target" ]; then
+        echo "Usage: $0 subscription_active <section>" >&2
+        return 2
+    fi
+    subscription_active_json "$target"
+}
+
 show_help() {
     cat << EOF
 Usage: $0 COMMAND
@@ -3100,6 +3111,11 @@ Available commands:
                             JSON latency for each filtered profile, queried
                             via the local Clash API. With force=1 actively
                             re-probes; default uses cached delay history.
+    subscription_active <section>
+                            JSON describing the currently URLTest-selected
+                            outbound for <section>: active tag, raw tag,
+                            endpoint, latency and recent delay history.
+                            Used by the LuCI "Now active" widget.
     check_proxy             Check proxy connectivity
     check_nft               Check NFT rules
     check_nft_rules         Check NFT rules status
@@ -3170,6 +3186,9 @@ subscription_test_url)
     ;;
 subscription_latency)
     subscription_latency_cli "$2" "$3"
+    ;;
+subscription_active)
+    subscription_active_cli "$2"
     ;;
 check_proxy)
     check_proxy

@@ -6,6 +6,40 @@
 "require tools.widgets as widgets";
 "require view.podkop.main as main";
 
+// Inject podkop-specific styles once per page load: dark-mode awareness for
+// the profiles/active modals + a soft fade/scale-in transition.
+(function injectPodkopStyles() {
+  if (typeof document === "undefined") return;
+  if (document.getElementById("podkop-tier3-styles")) return;
+  const css = [
+    ".podkop-chip{transition:transform .15s ease;}",
+    ".podkop-chip:hover{transform:translateY(-1px);}",
+    ".podkop-profile-row{transition:background-color .12s ease;}",
+    ".podkop-profile-row:hover{background-color:rgba(127,127,127,0.08);}",
+    "@keyframes podkopModalIn{",
+    "  from{opacity:0;transform:translateY(-8px) scale(.985);}",
+    "  to{opacity:1;transform:none;}",
+    "}",
+    ".modal[aria-modal='true']{animation:podkopModalIn .18s ease-out;}",
+    "#modal_overlay .modal{animation:podkopModalIn .18s ease-out;}",
+    "@media (prefers-color-scheme: dark){",
+    "  .podkop-active-card,.podkop-profile-row td{",
+    "    color:rgba(220,220,225,0.92);",
+    "  }",
+    "  .podkop-profile-row:hover{background-color:rgba(255,255,255,0.06);}",
+    "  .podkop-chip{filter:brightness(1.05);}",
+    "}",
+    "body[data-luci-theme*='dark'] .podkop-active-card,",
+    "body[data-luci-theme*='dark'] .podkop-profile-row td{",
+    "  color:rgba(220,220,225,0.92);",
+    "}",
+  ].join("");
+  const style = document.createElement("style");
+  style.id = "podkop-tier3-styles";
+  style.appendChild(document.createTextNode(css));
+  document.head.appendChild(style);
+})();
+
 function createSectionContent(section) {
   let o = section.option(
     form.ListValue,
@@ -738,6 +772,191 @@ function createSectionContent(section) {
       });
   };
 
+  // "Now active" widget — shows the currently URLTest-selected proxy with
+  // a sparkline of recent latency samples. Auto-refreshes every 5s while
+  // the modal is open.
+  o = section.option(
+    form.Button,
+    "_subscription_active_button",
+    _("Now active"),
+    _(
+      "Show the proxy currently selected by URLTest for this section, plus its recent latency history.",
+    ),
+  );
+  o.depends("proxy_config_type", "subscription");
+  o.inputstyle = "action";
+  o.onclick = function (ev, section_id) {
+    const baseStyle =
+      "display:grid;grid-template-columns:auto 1fr;gap:6px 16px;" +
+      "align-items:center;margin:8px 0;font-family:monospace;";
+    const card = E("div", {
+      class: "podkop-active-card",
+      style: baseStyle,
+    });
+    const meta = { timer: null };
+
+    const latencyClassLocal = function (ms) {
+      if (ms == null) return "color:#888";
+      if (ms < 100) return "color:#5cb85c;font-weight:bold";
+      if (ms < 300) return "color:#f0ad4e;font-weight:bold";
+      return "color:#d9534f;font-weight:bold";
+    };
+    const latencyColorLocal = function (ms) {
+      if (ms == null) return "#888";
+      if (ms < 100) return "#5cb85c";
+      if (ms < 300) return "#f0ad4e";
+      return "#d9534f";
+    };
+    // ASCII flag detection — same logic as in the profiles modal but
+    // duplicated here to keep the two onclick scopes independent.
+    const tagToFlagLocal = function (tag) {
+      if (!tag) return "";
+      const s = String(tag).toUpperCase();
+      const m = s.match(/[\uD83C][\uDDE6-\uDDFF][\uD83C][\uDDE6-\uDDFF]/);
+      if (m) return m[0];
+      const codes = [
+        "RU","NL","DE","FI","US","JP","HK","SG","FR","GB","UK","UA",
+        "TR","KZ","BY","SE","NO","DK","CH","AT","BE","IE","PL","CZ",
+        "ES","IT","PT","GR","RO","BG","CA","AU","NZ","KR","TW","BR",
+        "MX","AR","ZA","IN","IL","AE","CN","IS","LV","LT","EE","HU",
+        "SK","SI","HR","RS","MD","GE","AM","AZ"
+      ];
+      const aliases = { UK: "GB" };
+      for (let i = 0; i < codes.length; i++) {
+        const c = codes[i];
+        const re = new RegExp("(^|[^A-Z])" + c + "([^A-Z]|$)");
+        if (re.test(s)) {
+          const real = aliases[c] || c;
+          const A = 0x1f1e6;
+          return (
+            String.fromCodePoint(A + real.charCodeAt(0) - 65) +
+            String.fromCodePoint(A + real.charCodeAt(1) - 65)
+          );
+        }
+      }
+      return "";
+    };
+    const renderSparklineLocal = function (history, currentMs) {
+      const W = 120, H = 28, PAD = 2;
+      const wrap = E("span", {
+        style: "display:inline-block;vertical-align:middle;",
+      });
+      const samples = (history || []).filter(function (v) {
+        return typeof v === "number" && v > 0;
+      });
+      if (samples.length < 2) return wrap;
+      const max = Math.max.apply(null, samples);
+      const min = Math.min.apply(null, samples);
+      const span = Math.max(1, max - min);
+      const step = (W - 2 * PAD) / (samples.length - 1);
+      const pts = samples.map(function (v, i) {
+        const x = PAD + i * step;
+        const y = H - PAD - ((v - min) / span) * (H - 2 * PAD);
+        return x.toFixed(1) + "," + y.toFixed(1);
+      });
+      const ns = "http://www.w3.org/2000/svg";
+      const svg = document.createElementNS(ns, "svg");
+      svg.setAttribute("width", String(W));
+      svg.setAttribute("height", String(H));
+      const poly = document.createElementNS(ns, "polyline");
+      poly.setAttribute("fill", "none");
+      poly.setAttribute("stroke", latencyColorLocal(currentMs));
+      poly.setAttribute("stroke-width", "1.8");
+      poly.setAttribute("points", pts.join(" "));
+      svg.appendChild(poly);
+      wrap.appendChild(svg);
+      return wrap;
+    };
+
+    const repaint = function (info) {
+      while (card.firstChild) card.removeChild(card.firstChild);
+      if (!info || !info.available) {
+        card.appendChild(
+          E(
+            "div",
+            { style: "grid-column:1/-1;color:#888;text-align:center;" },
+            info && info.reason === "no_active_proxy"
+              ? _(
+                  "No proxy currently selected — sing-box may still be probing or every profile is stuck.",
+                )
+              : _(
+                  "Clash API not reachable — make sure sing-box is running.",
+                ),
+          ),
+        );
+        return;
+      }
+      const flag = tagToFlagLocal(info.raw_tag || info.active_tag || "");
+      card.appendChild(E("div", {}, _("Active:")));
+      card.appendChild(
+        E("div", { style: "font-size:1.1em;" }, [
+          flag
+            ? E("span", { style: "margin-right:6px;font-size:1.2em;" }, flag)
+            : "",
+          E(
+            "strong",
+            {},
+            info.raw_tag || info.active_tag || "-",
+          ),
+        ]),
+      );
+      if (info.endpoint) {
+        card.appendChild(E("div", {}, _("Endpoint:")));
+        card.appendChild(E("div", {}, info.endpoint));
+      }
+      card.appendChild(E("div", {}, _("Latency:")));
+      card.appendChild(
+        E(
+          "div",
+          { style: latencyClassLocal(info.latency) },
+          info.latency != null ? String(info.latency) + " ms" : "—",
+        ),
+      );
+      card.appendChild(E("div", {}, _("History:")));
+      const histCell = E("div", {});
+      histCell.appendChild(renderSparklineLocal(info.history, info.latency));
+      card.appendChild(histCell);
+    };
+
+    const refresh = function () {
+      return fs
+        .exec("/usr/bin/podkop", ["subscription_active", section_id])
+        .then(function (res) {
+          let info;
+          try {
+            info = JSON.parse(res.stdout || "{}");
+          } catch (e) {
+            info = { available: false, reason: "parse_error" };
+          }
+          repaint(info);
+        })
+        .catch(function () {
+          repaint({ available: false, reason: "exec_error" });
+        });
+    };
+
+    repaint(null);
+    refresh();
+    meta.timer = window.setInterval(refresh, 5000);
+
+    ui.showModal(_("Active proxy — %s").format(section_id), [
+      card,
+      E("div", { class: "right" }, [
+        E(
+          "button",
+          {
+            class: "btn",
+            click: function () {
+              if (meta.timer) window.clearInterval(meta.timer);
+              ui.hideModal();
+            },
+          },
+          _("Close"),
+        ),
+      ]),
+    ]);
+  };
+
   o = section.option(
     form.Button,
     "_subscription_show_button",
@@ -796,6 +1015,133 @@ function createSectionContent(section) {
       if (ms == null) return "—";
       return String(ms) + " ms";
     };
+    const latencyColor = function (ms) {
+      if (ms == null) return "#888";
+      if (ms < 100) return "#5cb85c";
+      if (ms < 300) return "#f0ad4e";
+      return "#d9534f";
+    };
+
+    // Best-effort detection of a 2-letter country code in a tag.
+    // Recognises ISO-3166-1 alpha-2 codes that pop up in commercial proxy
+    // panels (RU, NL, DE, FI, US, JP, …). Falls back to '' when nothing
+    // looks like a country.
+    const tagToFlag = function (tag) {
+      if (!tag) return "";
+      const s = String(tag).toUpperCase();
+      // Already an emoji flag — keep it.
+      const m = s.match(/[\uD83C][\uDDE6-\uDDFF][\uD83C][\uDDE6-\uDDFF]/);
+      if (m) return m[0];
+      const codes = [
+        "RU","NL","DE","FI","US","JP","HK","SG","FR","GB","UK","UA",
+        "TR","KZ","BY","SE","NO","DK","CH","AT","BE","IE","PL","CZ",
+        "ES","IT","PT","GR","RO","BG","CA","AU","NZ","KR","TW","BR",
+        "MX","AR","ZA","IN","IL","AE","CN","IS","LV","LT","EE","HU",
+        "SK","SI","HR","RS","MD","GE","AM","AZ"
+      ];
+      const aliases = { UK: "GB" };
+      for (let i = 0; i < codes.length; i++) {
+        const c = codes[i];
+        const re = new RegExp("(^|[^A-Z])" + c + "([^A-Z]|$)");
+        if (re.test(s)) {
+          const real = aliases[c] || c;
+          const A = 0x1f1e6;
+          const a = real.charCodeAt(0) - 65;
+          const b = real.charCodeAt(1) - 65;
+          return (
+            String.fromCodePoint(A + a) +
+            String.fromCodePoint(A + b)
+          );
+        }
+      }
+      return "";
+    };
+
+    // Chip-style badge for the proxy "type" column (vless, ss, trojan, …).
+    const kindBadge = function (kind, type) {
+      const label = (kind === "json" ? type || "json" : "url").toLowerCase();
+      const palette = {
+        vless:    { bg: "#5b8cff", fg: "#fff" },
+        vmess:    { bg: "#7d5bff", fg: "#fff" },
+        trojan:   { bg: "#d9534f", fg: "#fff" },
+        shadowsocks: { bg: "#5cb85c", fg: "#fff" },
+        ss:       { bg: "#5cb85c", fg: "#fff" },
+        socks:    { bg: "#888",    fg: "#fff" },
+        socks5:   { bg: "#888",    fg: "#fff" },
+        hysteria: { bg: "#f0ad4e", fg: "#fff" },
+        hysteria2:{ bg: "#f0ad4e", fg: "#fff" },
+        tuic:     { bg: "#11a8c2", fg: "#fff" },
+        wireguard:{ bg: "#9e1d6c", fg: "#fff" },
+        url:      { bg: "#444",    fg: "#fff" },
+        json:     { bg: "#444",    fg: "#fff" },
+      };
+      const c = palette[label] || palette.url;
+      return E(
+        "span",
+        {
+          class: "podkop-chip",
+          style:
+            "background:" + c.bg +
+            ";color:" + c.fg +
+            ";padding:2px 8px;border-radius:10px;font-size:11px;" +
+            "font-family:monospace;text-transform:uppercase;letter-spacing:0.3px;",
+        },
+        label,
+      );
+    };
+
+    // Tiny inline SVG sparkline (last N latency samples). Returns an empty
+    // node when there's nothing meaningful to draw.
+    const renderSparkline = function (history, currentMs) {
+      const W = 60, H = 18, PAD = 1;
+      const wrap = E("span", {
+        style:
+          "display:inline-block;vertical-align:middle;margin-right:4px;" +
+          "min-width:" + W + "px;",
+      });
+      const samples = (history || []).filter(function (v) {
+        return typeof v === "number" && v > 0;
+      });
+      if (samples.length < 2) {
+        return wrap; // nothing to draw
+      }
+      const max = Math.max.apply(null, samples);
+      const min = Math.min.apply(null, samples);
+      const span = Math.max(1, max - min);
+      const step = (W - 2 * PAD) / (samples.length - 1);
+      const pts = samples.map(function (v, i) {
+        const x = PAD + i * step;
+        const y = H - PAD - ((v - min) / span) * (H - 2 * PAD);
+        return x.toFixed(1) + "," + y.toFixed(1);
+      });
+      const ns = "http://www.w3.org/2000/svg";
+      const svg = document.createElementNS(ns, "svg");
+      svg.setAttribute("width", String(W));
+      svg.setAttribute("height", String(H));
+      svg.setAttribute("class", "podkop-sparkline");
+      svg.style.overflow = "visible";
+      const poly = document.createElementNS(ns, "polyline");
+      poly.setAttribute("fill", "none");
+      poly.setAttribute(
+        "stroke",
+        latencyColor(currentMs != null ? currentMs : samples[samples.length - 1]),
+      );
+      poly.setAttribute("stroke-width", "1.5");
+      poly.setAttribute("points", pts.join(" "));
+      svg.appendChild(poly);
+      // Endpoint dot.
+      const last = samples[samples.length - 1];
+      const lastX = PAD + (samples.length - 1) * step;
+      const lastY = H - PAD - ((last - min) / span) * (H - 2 * PAD);
+      const dot = document.createElementNS(ns, "circle");
+      dot.setAttribute("cx", lastX.toFixed(1));
+      dot.setAttribute("cy", lastY.toFixed(1));
+      dot.setAttribute("r", "2");
+      dot.setAttribute("fill", latencyColor(last));
+      svg.appendChild(dot);
+      wrap.appendChild(svg);
+      return wrap;
+    };
 
     return Promise.all([
       fs.exec("/usr/bin/podkop", ["subscription_status", section_id]),
@@ -811,10 +1157,12 @@ function createSectionContent(section) {
         } catch (e) {
           latency = [];
         }
-        // Map raw_tag -> latency for quick join.
+        // Map raw_tag -> latency + history for quick join.
         const latencyByTag = {};
+        const historyByTag = {};
         for (let i = 0; i < latency.length; i++) {
           latencyByTag[latency[i].raw_tag] = latency[i].latency;
+          historyByTag[latency[i].raw_tag] = latency[i].history || [];
         }
 
         const lastUpdate = status.last_update
@@ -908,10 +1256,46 @@ function createSectionContent(section) {
             const ms = latencyByTag.hasOwnProperty(it.tag)
               ? latencyByTag[it.tag]
               : null;
+            const hist = historyByTag[it.tag] || [];
+            const flag = tagToFlag(it.tag || "");
+            const tagCell = E(
+              "td",
+              { class: "td", style: "font-family:monospace;" },
+              [],
+            );
+            if (flag) {
+              tagCell.appendChild(
+                E(
+                  "span",
+                  {
+                    class: "podkop-flag",
+                    style:
+                      "font-size:1.1em;margin-right:6px;vertical-align:middle;",
+                  },
+                  flag,
+                ),
+              );
+            }
+            tagCell.appendChild(document.createTextNode(it.tag || "-"));
+            const latencyCell = E(
+              "td",
+              {
+                class: "td",
+                style:
+                  "text-align:right;font-family:monospace;width:160px;" +
+                  "white-space:nowrap;" +
+                  latencyClass(ms),
+              },
+              [],
+            );
+            latencyCell.appendChild(renderSparkline(hist, ms));
+            latencyCell.appendChild(
+              document.createTextNode(latencyText(ms)),
+            );
             return E(
               "tr",
               {
-                class: "tr",
+                class: "tr podkop-profile-row",
                 style: isMatch ? "" : "opacity:0.55",
               },
               [
@@ -920,31 +1304,18 @@ function createSectionContent(section) {
                   { class: "td", style: "text-align:center;width:32px;" },
                   isMatch ? "✓" : "",
                 ),
+                tagCell,
                 E(
                   "td",
-                  { class: "td", style: "font-family:monospace;" },
-                  it.tag || "-",
-                ),
-                E(
-                  "td",
-                  { class: "td", style: "width:80px;" },
-                  it.kind === "json" ? it.type || "json" : "url",
+                  { class: "td", style: "width:96px;" },
+                  kindBadge(it.kind, it.type),
                 ),
                 E(
                   "td",
                   { class: "td", style: "font-family:monospace;" },
                   it.endpoint || "-",
                 ),
-                E(
-                  "td",
-                  {
-                    class: "td",
-                    style:
-                      "text-align:right;font-family:monospace;width:90px;" +
-                      latencyClass(ms),
-                  },
-                  latencyText(ms),
-                ),
+                latencyCell,
               ],
             );
           });
@@ -1034,6 +1405,7 @@ function createSectionContent(section) {
               }
               for (let i = 0; i < fresh.length; i++) {
                 latencyByTag[fresh[i].raw_tag] = fresh[i].latency;
+                historyByTag[fresh[i].raw_tag] = fresh[i].history || [];
               }
               renderRows();
             })
