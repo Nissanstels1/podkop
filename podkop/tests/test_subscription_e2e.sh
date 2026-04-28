@@ -258,6 +258,21 @@ _subscription_stuck_clear main main-1
 subscription_tag_is_stuck main main-1 && nope "should be cleared" \
     || ok "clear removes stuck flag"
 
+echo "=== E2E 15: subscription_active_json without Clash returns available=false ==="
+# Point Clash API to a definitely-closed port so the call fails fast.
+out=$(CLASH_API_BASE="http://127.0.0.1:1" subscription_active_json main)
+echo "$out" | jq -e '.available == false and (.reason | type == "string")' \
+    >/dev/null \
+    && ok "active_json fails gracefully without clash" \
+    || nope "expected available=false, got '$out'"
+
+echo "=== E2E 16: subscription_latency_json includes history field ==="
+out=$(CLASH_API_BASE="http://127.0.0.1:1" subscription_latency_json main 0)
+# When clash is unreachable each row has latency=null and history=[].
+echo "$out" | jq -e 'all(.history | type == "array")' >/dev/null \
+    && ok "latency_json rows carry history arrays" \
+    || nope "missing history field: $out"
+
 echo
 echo "=================="
 echo "PASSED: $pass"

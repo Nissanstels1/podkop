@@ -971,7 +971,7 @@ subscription_health_check() {
 
     while IFS= read -r line; do
         [ -z "$line" ] && continue
-        tag="$section-$i"
+        tag="$section-$i-out"
         i=$((i + 1))
 
         if _subscription_clash_delay "$tag" "$probe_url" 3000; then
@@ -1308,35 +1308,40 @@ subscription_latency_json() {
     i=1
     while IFS= read -r line; do
         [ -z "$line" ] && continue
-        tag="$section-$i"
+        tag="$section-$i-out"
         i=$((i + 1))
 
         local raw_tag
         raw_tag="$(subscription_line_get_tag "$line")"
 
-        local delay=""
+        local delay="" history="[]"
+        # Always fetch /proxies/<tag> so we get the recent delay history (used
+        # by the LuCI sparkline). When force=1 we trigger a fresh probe first
+        # via /proxies/<tag>/delay so the history captures a fresh sample.
         if [ "$force" = "1" ]; then
-            local response
-            response="$(curl -fsS --max-time 8 \
+            curl -fsS --max-time 8 \
                 "$base/proxies/$tag/delay?timeout=3000&url=$probe_url" \
-                2>/dev/null)"
-            delay="$(printf '%s' "$response" \
-                | jq -r '.delay // empty' 2>/dev/null)"
-        else
-            local response
-            response="$(curl -fsS --max-time 3 \
-                "$base/proxies/$tag" 2>/dev/null)"
+                >/dev/null 2>&1 || true
+        fi
+        local response
+        response="$(curl -fsS --max-time 3 "$base/proxies/$tag" 2>/dev/null)"
+        if [ -n "$response" ]; then
             delay="$(printf '%s' "$response" \
                 | jq -r '.history // [] | map(.delay) | last // empty' \
                     2>/dev/null)"
+            history="$(printf '%s' "$response" \
+                | jq -c '.history // [] | map(.delay) | .[-10:]' \
+                    2>/dev/null)"
+            [ -z "$history" ] && history="[]"
         fi
         # Treat empty/null/0 as "no data".
         case "$delay" in
             ''|null|0) delay="" ;;
         esac
 
-        # Tab-separated raw record; jq converts to JSON below.
-        printf '%s\t%s\t%s\n' "$tag" "$raw_tag" "$delay" >> "$result_file"
+        # 4 tab-separated columns: tag, raw_tag, delay, history JSON array.
+        printf '%s\t%s\t%s\t%s\n' \
+            "$tag" "$raw_tag" "$delay" "$history" >> "$result_file"
     done < "$tmpfile"
     rm -f "$tmpfile"
 
@@ -1347,10 +1352,92 @@ subscription_latency_json() {
         | map({
             tag:     .[0],
             raw_tag: .[1],
-            latency: (if (.[2] // "") == "" then null else (.[2] | tonumber? // null) end)
+            latency: (if (.[2] // "") == "" then null else (.[2] | tonumber? // null) end),
+            history: ((.[3] // "[]") | fromjson? // [])
           })
     ' < "$result_file"
     rm -f "$result_file"
+}
+
+# JSON describing the currently active (URLTest-selected) outbound for a
+# subscription section. Used by the LuCI "Now active" dashboard widget.
+subscription_active_json() {
+    local section="$1"
+    local base="${CLASH_API_BASE:-http://127.0.0.1:9090}"
+    local urltest_tag="$section-urltest-out"
+    local resp now history latency latency_int parsed line raw_tag endpoint
+
+    resp="$(curl -fsS --max-time 3 "$base/proxies/$urltest_tag" 2>/dev/null)"
+    if [ -z "$resp" ]; then
+        jq -n --arg section "$section" \
+            '{section:$section, available:false, reason:"clash_unreachable"}'
+        return 0
+    fi
+
+    now="$(printf '%s' "$resp" | jq -r '.now // empty' 2>/dev/null)"
+    if [ -z "$now" ]; then
+        jq -n --arg section "$section" \
+            '{section:$section, available:false, reason:"no_active_proxy"}'
+        return 0
+    fi
+
+    # Fetch the picked profile to get fresh history and endpoint info.
+    resp="$(curl -fsS --max-time 3 "$base/proxies/$now" 2>/dev/null)"
+    history="$(printf '%s' "$resp" \
+        | jq -c '.history // [] | map(.delay) | .[-10:]' 2>/dev/null)"
+    [ -z "$history" ] && history="[]"
+    latency="$(printf '%s' "$resp" \
+        | jq -r '.history // [] | map(.delay) | last // empty' 2>/dev/null)"
+    case "$latency" in ''|null|0) latency="" ;; esac
+
+    # Best-effort: figure out the human-readable raw_tag and endpoint of
+    # the active profile by re-using the latency table's mapping.
+    raw_tag=""
+    endpoint=""
+    parsed="$(subscription_cache_path_parsed "$section")"
+    if [ -r "$parsed" ]; then
+        local i=1 found_line=""
+        while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            if [ "$section-$i-out" = "$now" ]; then
+                found_line="$line"
+                break
+            fi
+            i=$((i + 1))
+        done < "$parsed"
+        if [ -n "$found_line" ]; then
+            raw_tag="$(subscription_line_get_tag "$found_line")"
+            local kind rest host port
+            kind="${found_line%% *}"
+            rest="${found_line#"$kind "}"
+            case "$kind" in
+                url)
+                    host="$(url_get_host "$rest" 2>/dev/null)"
+                    port="$(url_get_port "$rest" 2>/dev/null)"
+                    [ -n "$host" ] && [ -n "$port" ] \
+                        && endpoint="$host:$port" \
+                        || endpoint="$host"
+                    ;;
+            esac
+        fi
+    fi
+
+    jq -n \
+        --arg section   "$section" \
+        --arg active    "$now" \
+        --arg raw_tag   "$raw_tag" \
+        --arg endpoint  "$endpoint" \
+        --arg latency   "$latency" \
+        --argjson hist  "$history" \
+        '{
+            section:  $section,
+            available: true,
+            active_tag: $active,
+            raw_tag:   $raw_tag,
+            endpoint:  $endpoint,
+            latency:   ($latency | tonumber? // null),
+            history:   $hist
+        }'
 }
 
 # vim: ft=sh ts=4 sw=4 et
