@@ -130,6 +130,134 @@ subscription_update_section bad && nope "should have failed" || ok "update repor
     grep -q "fetch_failed" "$SUBSCRIPTION_CACHE_DIR/bad.meta" \
     && ok "meta says fetch_failed" || nope "meta missing"
 
+echo "=== E2E 7: meta now has 7 columns (sha256, fallback flag, last_attempt) ==="
+ncols=$(awk -F'\t' 'NR==1{print NF; exit}' "$SUBSCRIPTION_CACHE_DIR/main.meta")
+[ "$ncols" = "7" ] && ok "meta has 7 columns" || nope "got $ncols"
+
+sha=$(awk -F'\t' 'NR==1{print $5; exit}' "$SUBSCRIPTION_CACHE_DIR/main.meta")
+[ -n "$sha" ] && [ ${#sha} = "64" ] && ok "sha256 stored ($sha)" || nope "missing/short sha=$sha"
+
+echo "=== E2E 8: status JSON exposes sha256 + fallback_in_use ==="
+status=$(subscription_status_json main)
+echo "$status" | jq -e '.sha256 != null and .sha256 != "" and .fallback_in_use == false' >/dev/null \
+    && ok "status JSON has sha256 + fallback flag" || nope "$status"
+
+echo "=== E2E 9: fetch fails — fallback to previous parsed cache + flag ==="
+# Save current parsed state, then point primary at a 404 with no fallback.
+_uci_main_subscription_url="http://127.0.0.1:18888/does-not-exist-now"
+prev_count=$(wc -l < "$SUBSCRIPTION_CACHE_DIR/main.parsed")
+subscription_update_section main && nope "should have failed" || ok "update reported failure"
+new_count=$(wc -l < "$SUBSCRIPTION_CACHE_DIR/main.parsed")
+[ "$prev_count" = "$new_count" ] && ok "previous parsed cache preserved" || \
+    nope "parsed went from $prev_count to $new_count"
+status=$(subscription_status_json main)
+echo "$status" | jq -e '.fallback_in_use == true and .status == "fetch_failed"' >/dev/null \
+    && ok "status reports fallback_in_use=true" || nope "$status"
+filtered=$(echo "$status" | jq '.filtered')
+[ "$filtered" -gt 0 ] && ok "load_filtered still serves $filtered profiles" || nope "filtered=$filtered"
+
+# Restore primary URL for the rest of the suite.
+_uci_main_subscription_url="http://127.0.0.1:18888/sub_b64"
+subscription_update_section main >/dev/null
+
+echo "=== E2E 10: fallback URL chain — primary 404, fallback OK ==="
+_uci_chain_subscription_url="http://127.0.0.1:18888/does-not-exist"
+_uci_chain_subscription_url_fallback="http://127.0.0.1:18888/sub_b64"
+_uci_chain_subscription_format="auto"
+_uci_chain_subscription_user_agent="auto"
+_uci_chain_subscription_allow_insecure="0"
+subscription_update_section chain && ok "fallback URL succeeded" || nope "fallback failed"
+n=$(wc -l < "$SUBSCRIPTION_CACHE_DIR/chain.parsed")
+[ "$n" = "4" ] && ok "fallback chain parsed 4 profiles" || nope "got $n"
+status=$(awk -F'\t' 'NR==1{print $4}' "$SUBSCRIPTION_CACHE_DIR/chain.meta")
+[ "$status" = "ok" ] && ok "chain status=ok" || nope "got '$status'"
+
+echo "=== E2E 11: short-circuit when sha256 unchanged ==="
+# Capture pre-update timestamp, sleep briefly, run again, expect status=ok and
+# (because sha did not change) parsed file is untouched.
+sha1=$(awk -F'\t' 'NR==1{print $5}' "$SUBSCRIPTION_CACHE_DIR/main.meta")
+mtime1=$(stat -c '%Y' "$SUBSCRIPTION_CACHE_DIR/main.parsed")
+sleep 1
+subscription_update_section main >/dev/null
+sha2=$(awk -F'\t' 'NR==1{print $5}' "$SUBSCRIPTION_CACHE_DIR/main.meta")
+mtime2=$(stat -c '%Y' "$SUBSCRIPTION_CACHE_DIR/main.parsed")
+[ "$sha1" = "$sha2" ] && ok "sha256 unchanged across updates" || nope "$sha1 vs $sha2"
+[ "$mtime1" = "$mtime2" ] && ok "parsed file untouched (short-circuit)" \
+    || nope "parsed mtime changed: $mtime1 -> $mtime2"
+
+echo "=== E2E 12: parsed.prev backup created on second successful update ==="
+# Point at a different content for one update so we get a backup created.
+cp "$WORK/srv/sub_b64" "$WORK/srv/sub_b64.copy"
+echo 'vless://uuid@new.example:443?type=tcp#NEW-Server' \
+    | base64 -w0 > "$WORK/srv/sub_b64"
+_uci_chain_subscription_url="http://127.0.0.1:18888/sub_b64"
+_uci_chain_subscription_url_fallback=""
+subscription_update_section chain >/dev/null
+[ -r "$SUBSCRIPTION_CACHE_DIR/chain.parsed.prev" ] \
+    && ok "parsed.prev backup written" \
+    || nope ".prev missing"
+# Restore the original sub_b64 so subsequent test runs are stable.
+cp "$WORK/srv/sub_b64.copy" "$WORK/srv/sub_b64"
+
+echo "=== E2E 13a: progress JSON populated on a fresh section ==="
+SUBSCRIPTION_PROGRESS_DIR="$WORK/progress"
+_uci_progsec_subscription_url="http://127.0.0.1:18888/sub_b64"
+_uci_progsec_subscription_format="auto"
+_uci_progsec_subscription_user_agent="auto"
+_uci_progsec_subscription_allow_insecure="0"
+subscription_update_section progsec >/dev/null
+prog=$(subscription_progress_json progsec)
+echo "$prog" | jq -e '.section == "progsec" and (.stages | length) > 0' >/dev/null \
+    && ok "progress JSON has stages" || nope "$prog"
+echo "$prog" | jq -e '[.stages[].stage] | contains(["fetching","parsing","done"])' >/dev/null \
+    && ok "progress includes fetching/parsing/done on first run" || nope "$prog"
+
+echo "=== E2E 13b: progress JSON shows 'unchanged' on identical re-fetch ==="
+subscription_update_section progsec >/dev/null
+prog=$(subscription_progress_json progsec)
+echo "$prog" | jq -e '[.stages[].stage] | contains(["unchanged","done"])' >/dev/null \
+    && ok "second update emits unchanged + done" || nope "$prog"
+
+echo "=== E2E 13c: validate JSON happy path ==="
+val=$(subscription_validate_json main)
+echo "$val" | jq -e '.section == "main" and .ok == true' >/dev/null \
+    && ok "validate returns ok=true" || nope "$val"
+echo "$val" | jq -e '[.checks[].stage] | contains(["dns","tcp","http","format","parse"])' >/dev/null \
+    && ok "validate has dns/tcp/http/format/parse stages" || nope "$val"
+
+echo "=== E2E 13d: validate JSON for missing URL section ==="
+val=$(subscription_validate_json missing)
+echo "$val" | jq -e '.ok == false and (.checks[0].stage == "config")' >/dev/null \
+    && ok "validate flags missing subscription_url" || nope "$val"
+
+echo "=== E2E 13e: test_url JSON for valid endpoint ==="
+tu=$(subscription_test_url_json "http://127.0.0.1:18888/sub_b64" "podkop" "0")
+echo "$tu" | jq -e '.ok == true and .http_code == 200 and .format_guess == "base64"' >/dev/null \
+    && ok "test_url ok+200+base64" || nope "$tu"
+
+echo "=== E2E 13f: test_url JSON for 404 ==="
+tu=$(subscription_test_url_json "http://127.0.0.1:18888/does-not-exist" "podkop" "0")
+echo "$tu" | jq -e '.ok == false and .http_code == 404 and (.error // "" | contains("HTTP"))' >/dev/null \
+    && ok "test_url reports 404" || nope "$tu"
+
+echo "=== E2E 13: stuck-server tracker JSON empty by default ==="
+out=$(subscription_stuck_json main)
+[ "$out" = "[]" ] && ok "stuck_json returns []" || nope "got '$out'"
+
+echo "=== E2E 14: stuck-server tag tracker marks + clears + threshold ==="
+SUBSCRIPTION_STUCK_THRESHOLD=2
+SUBSCRIPTION_STUCK_RECOVERY_AFTER=1800
+now=$(date +%s)
+_subscription_stuck_mark_fail main main-1 "$now"
+subscription_tag_is_stuck main main-1 && nope "should not be stuck after 1 fail" \
+    || ok "1 fail < threshold (not stuck yet)"
+_subscription_stuck_mark_fail main main-1 "$now"
+subscription_tag_is_stuck main main-1 && ok "2 fails -> stuck" \
+    || nope "expected stuck"
+_subscription_stuck_clear main main-1
+subscription_tag_is_stuck main main-1 && nope "should be cleared" \
+    || ok "clear removes stuck flag"
+
 echo
 echo "=================="
 echo "PASSED: $pass"
