@@ -199,6 +199,47 @@ subscription_update_section chain >/dev/null
 # Restore the original sub_b64 so subsequent test runs are stable.
 cp "$WORK/srv/sub_b64.copy" "$WORK/srv/sub_b64"
 
+echo "=== E2E 13a: progress JSON populated on a fresh section ==="
+SUBSCRIPTION_PROGRESS_DIR="$WORK/progress"
+_uci_progsec_subscription_url="http://127.0.0.1:18888/sub_b64"
+_uci_progsec_subscription_format="auto"
+_uci_progsec_subscription_user_agent="auto"
+_uci_progsec_subscription_allow_insecure="0"
+subscription_update_section progsec >/dev/null
+prog=$(subscription_progress_json progsec)
+echo "$prog" | jq -e '.section == "progsec" and (.stages | length) > 0' >/dev/null \
+    && ok "progress JSON has stages" || nope "$prog"
+echo "$prog" | jq -e '[.stages[].stage] | contains(["fetching","parsing","done"])' >/dev/null \
+    && ok "progress includes fetching/parsing/done on first run" || nope "$prog"
+
+echo "=== E2E 13b: progress JSON shows 'unchanged' on identical re-fetch ==="
+subscription_update_section progsec >/dev/null
+prog=$(subscription_progress_json progsec)
+echo "$prog" | jq -e '[.stages[].stage] | contains(["unchanged","done"])' >/dev/null \
+    && ok "second update emits unchanged + done" || nope "$prog"
+
+echo "=== E2E 13c: validate JSON happy path ==="
+val=$(subscription_validate_json main)
+echo "$val" | jq -e '.section == "main" and .ok == true' >/dev/null \
+    && ok "validate returns ok=true" || nope "$val"
+echo "$val" | jq -e '[.checks[].stage] | contains(["dns","tcp","http","format","parse"])' >/dev/null \
+    && ok "validate has dns/tcp/http/format/parse stages" || nope "$val"
+
+echo "=== E2E 13d: validate JSON for missing URL section ==="
+val=$(subscription_validate_json missing)
+echo "$val" | jq -e '.ok == false and (.checks[0].stage == "config")' >/dev/null \
+    && ok "validate flags missing subscription_url" || nope "$val"
+
+echo "=== E2E 13e: test_url JSON for valid endpoint ==="
+tu=$(subscription_test_url_json "http://127.0.0.1:18888/sub_b64" "podkop" "0")
+echo "$tu" | jq -e '.ok == true and .http_code == 200 and .format_guess == "base64"' >/dev/null \
+    && ok "test_url ok+200+base64" || nope "$tu"
+
+echo "=== E2E 13f: test_url JSON for 404 ==="
+tu=$(subscription_test_url_json "http://127.0.0.1:18888/does-not-exist" "podkop" "0")
+echo "$tu" | jq -e '.ok == false and .http_code == 404 and (.error // "" | contains("HTTP"))' >/dev/null \
+    && ok "test_url reports 404" || nope "$tu"
+
 echo "=== E2E 13: stuck-server tracker JSON empty by default ==="
 out=$(subscription_stuck_json main)
 [ "$out" = "[]" ] && ok "stuck_json returns []" || nope "got '$out'"

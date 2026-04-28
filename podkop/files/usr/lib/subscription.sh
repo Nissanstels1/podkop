@@ -50,6 +50,39 @@
 
 SUBSCRIPTION_CACHE_DIR="${SUBSCRIPTION_CACHE_DIR:-/etc/podkop/subscriptions}"
 
+# Volatile per-section progress files written by subscription_update_section.
+# The LuCI page polls these to render a real-stage progress bar instead of
+# a dumb spinner. Path is /tmp/* on purpose: progress is ephemeral and we
+# don't want to pollute /etc snapshots.
+SUBSCRIPTION_PROGRESS_DIR="${SUBSCRIPTION_PROGRESS_DIR:-/tmp/podkop-progress}"
+
+_subscription_progress_path() {
+    echo "$SUBSCRIPTION_PROGRESS_DIR/$1.progress"
+}
+
+# Append a single tab-separated record `<ts>\t<stage>\t<detail>` to the
+# section's progress file. Cheap (one printf, no jq) so it's safe to call
+# many times during an update.
+_subscription_progress_write() {
+    local section="$1" stage="$2" detail="$3"
+    [ -z "$section" ] && return 0
+    [ -z "$stage" ]   && return 0
+    mkdir -p "$SUBSCRIPTION_PROGRESS_DIR" 2>/dev/null
+    local ts
+    ts="$(date +%s)"
+    printf '%s\t%s\t%s\n' "$ts" "$stage" "$detail" \
+        >> "$(_subscription_progress_path "$section")" 2>/dev/null || true
+}
+
+# Reset the per-section progress file. Called at the start of every update
+# so the LuCI poller never sees stale stages from a previous run.
+_subscription_progress_reset() {
+    local section="$1"
+    [ -z "$section" ] && return 0
+    mkdir -p "$SUBSCRIPTION_PROGRESS_DIR" 2>/dev/null
+    : > "$(_subscription_progress_path "$section")" 2>/dev/null || true
+}
+
 # --- User-Agent selection ----------------------------------------------------
 
 # Pick the User-Agent header to send. If the user explicitly set a string
@@ -472,12 +505,16 @@ subscription_update_section() {
 
     [ -z "$section" ] && return 2
 
+    _subscription_progress_reset "$section"
+    _subscription_progress_write "$section" "start" "$section"
+
     config_get ua_setting     "$section" "subscription_user_agent" "auto"
     config_get format         "$section" "subscription_format" "auto"
     config_get allow_insecure "$section" "subscription_allow_insecure" "0"
 
     urls="$(subscription_collect_urls "$section")"
     if [ -z "$urls" ]; then
+        _subscription_progress_write "$section" "error" "no subscription_url configured"
         return 2
     fi
 
@@ -490,6 +527,7 @@ subscription_update_section() {
     # --- Step 1: fetch (try every URL in order) ----------------------------
     body=""
     tried_urls=""
+    _subscription_progress_write "$section" "fetching" ""
     local IFS_OLD="$IFS"
     IFS="
 "
@@ -501,12 +539,15 @@ subscription_update_section() {
             continue
         fi
         log "subscription[$section]: fetching $url (UA=$ua)" "info"
+        _subscription_progress_write "$section" "fetching" "$url"
         body="$(subscription_fetch "$url" "$ua" "$allow_insecure" 2>/dev/null)"
         if [ -n "$body" ]; then
             used_url="$url"
+            _subscription_progress_write "$section" "fetched" "${#body} bytes"
             break
         fi
         log "subscription[$section]: fetch from $url failed, trying fallback" "warn"
+        _subscription_progress_write "$section" "fetch_retry" "$url"
         tried_urls="$tried_urls $url"
         IFS="
 "
@@ -528,11 +569,13 @@ subscription_update_section() {
         [ -z "$prev_count" ] && prev_count="0"
         _subscription_write_meta "$section" "$prev_ts" "$prev_count" "$format" \
             "fetch_failed" "$prev_sha" "$fallback" "$ts"
+        _subscription_progress_write "$section" "error" "fetch failed for all URLs"
         log "subscription[$section]: fetch failed for all URLs" "error"
         return 1
     fi
 
     # --- Step 2: detect format -------------------------------------------
+    _subscription_progress_write "$section" "detecting" ""
     if [ "$format" = "auto" ] || [ -z "$format" ]; then
         actual_format="$(subscription_detect_format "$body")"
     else
@@ -540,6 +583,7 @@ subscription_update_section() {
     fi
 
     new_sha="$(printf '%s' "$body" | _subscription_sha256_stdin)"
+    _subscription_progress_write "$section" "format" "$actual_format"
 
     # --- Step 3: short-circuit if body identical -------------------------
     if [ -n "$new_sha" ] && [ "$new_sha" = "$prev_sha" ] && \
@@ -548,11 +592,14 @@ subscription_update_section() {
         [ -z "$count" ] && count="0"
         _subscription_write_meta "$section" "$ts" "$count" "$actual_format" \
             "ok" "$new_sha" "0" "$ts"
+        _subscription_progress_write "$section" "unchanged" "$count profiles"
+        _subscription_progress_write "$section" "done" "$count"
         log "subscription[$section]: ok unchanged ($count profiles)" "info"
         return 0
     fi
 
     # --- Step 4: parse ---------------------------------------------------
+    _subscription_progress_write "$section" "parsing" ""
     parsed_tmp="$(subscription_cache_path_parsed "$section").tmp"
     if ! subscription_parse "$body" "$actual_format" > "$parsed_tmp"; then
         rm -f "$parsed_tmp"
@@ -565,6 +612,7 @@ subscription_update_section() {
         [ -z "$prev_count" ] && prev_count="0"
         _subscription_write_meta "$section" "$prev_ts" "$prev_count" \
             "$actual_format" "parse_failed" "$prev_sha" "$fallback" "$ts"
+        _subscription_progress_write "$section" "error" "parse failed"
         log "subscription[$section]: parse failed (kept previous cache)" "error"
         return 1
     fi
@@ -581,9 +629,12 @@ subscription_update_section() {
         [ -z "$prev_count" ] && prev_count="0"
         _subscription_write_meta "$section" "$prev_ts" "$prev_count" \
             "$actual_format" "empty" "$prev_sha" "$fallback" "$ts"
+        _subscription_progress_write "$section" "error" "parsed 0 profiles"
         log "subscription[$section]: parsed 0 profiles (kept previous cache)" "error"
         return 1
     fi
+
+    _subscription_progress_write "$section" "parsed" "$count"
 
     # --- Step 5: rotate cache atomically --------------------------------
     # Backup current parsed → .prev BEFORE overwriting.
@@ -597,6 +648,7 @@ subscription_update_section() {
     _subscription_write_meta "$section" "$ts" "$count" "$actual_format" \
         "ok" "$new_sha" "0" "$ts"
 
+    _subscription_progress_write "$section" "done" "$count"
     if [ -n "$tried_urls" ]; then
         log "subscription[$section]: ok via fallback URL ($count profiles, format=$actual_format)" "info"
     else
@@ -931,6 +983,357 @@ subscription_health_check() {
     rm -f "$tmpfile"
 
     return 0
+}
+
+# --- Tier 2: progress / validate / test_url / latency -----------------------
+
+# Pretty-print the per-section progress file as JSON. Used by the LuCI
+# "Update subscription now" button to render a real-stage progress bar.
+# Returns `{"section": "...", "stages": []}` if no progress file exists.
+subscription_progress_json() {
+    local section="$1"
+    local file
+    file="$(_subscription_progress_path "$section")"
+
+    if [ ! -r "$file" ]; then
+        jq -n --arg s "$section" '{section: $s, stages: []}'
+        return 0
+    fi
+
+    jq -R -s --arg s "$section" '
+        split("\n")
+        | map(select(. != ""))
+        | map(split("\t"))
+        | map({
+            ts:     (.[0] | tonumber? // 0),
+            stage:  (.[1] // ""),
+            detail: (.[2] // "")
+          })
+        | { section: $s, stages: . }
+    ' < "$file"
+}
+
+# Quick "kick the tires" probe of an arbitrary URL. Used by the
+# "Test connection" button next to subscription_url so the user can sanity
+# check a URL before saving the form. No state is touched on disk.
+#
+# Args:
+#   $1 url
+#   $2 user_agent  (optional, defaults to "podkop")
+#   $3 allow_insecure ("1" to skip TLS verification, optional)
+subscription_test_url_json() {
+    local url="$1"
+    local ua="$2"
+    local allow_insecure="$3"
+    [ -z "$ua" ] && ua="podkop"
+
+    if [ -z "$url" ]; then
+        echo '{"ok":false,"error":"empty url"}'
+        return 0
+    fi
+
+    local extra=""
+    [ "$allow_insecure" = "1" ] && extra="-k"
+
+    # Single curl HEAD with timing + remote IP capture.
+    # %{time_connect} = TCP, %{time_appconnect} = TLS handshake,
+    # %{time_total}   = end-to-end.
+    local out rc
+    # shellcheck disable=SC2086
+    out="$(curl -sS $extra --connect-timeout 8 --max-time 15 -o /dev/null \
+        -w 'http_code=%{http_code}\nsize=%{size_download}\nct=%{content_type}\nrip=%{remote_ip}\ntc=%{time_connect}\ntac=%{time_appconnect}\ntt=%{time_total}\n' \
+        -I -A "$ua" "$url" 2>/dev/null)"
+    rc=$?
+
+    local http_code size ct rip tc tac tt
+    http_code="$(printf '%s\n' "$out" | sed -n 's/^http_code=//p')"
+    size="$(printf '%s\n' "$out" | sed -n 's/^size=//p')"
+    ct="$(printf '%s\n' "$out" | sed -n 's/^ct=//p')"
+    rip="$(printf '%s\n' "$out" | sed -n 's/^rip=//p')"
+    tc="$(printf '%s\n' "$out" | sed -n 's/^tc=//p')"
+    tac="$(printf '%s\n' "$out" | sed -n 's/^tac=//p')"
+    tt="$(printf '%s\n' "$out" | sed -n 's/^tt=//p')"
+
+    local latency_ms tls_ms tcp_ms
+    tcp_ms="$(awk -v v="$tc"  'BEGIN{ if (v>0) print int(v*1000); else print 0 }')"
+    tls_ms="$(awk -v v="$tac" 'BEGIN{ if (v>0) print int(v*1000); else print 0 }')"
+    latency_ms="$(awk -v v="$tt"  'BEGIN{ if (v>0) print int(v*1000); else print 0 }')"
+
+    # Sample first 8KB to detect format. Treat empty body as unknown.
+    # `|| true` so a 4xx from the format probe never aborts the caller
+    # (subscription_test_url_json must always emit a JSON object).
+    local sample format_guess="unknown"
+    # shellcheck disable=SC2086
+    sample="$(curl -fsS $extra --max-time 15 \
+        -A "$ua" \
+        --range 0-8192 \
+        "$url" 2>/dev/null || true)"
+    if [ -n "$sample" ]; then
+        format_guess="$(subscription_detect_format "$sample")"
+    fi
+
+    local ok="false" error=""
+    case "$http_code" in
+        2*) ok="true" ;;
+        '') error="curl exit $rc" ;;
+        *)  error="HTTP $http_code" ;;
+    esac
+
+    jq -n \
+        --arg url    "$url" \
+        --arg ok     "$ok" \
+        --arg http_code "$http_code" \
+        --arg size      "$size" \
+        --arg ct        "$ct" \
+        --arg rip       "$rip" \
+        --arg tcp_ms    "$tcp_ms" \
+        --arg tls_ms    "$tls_ms" \
+        --arg latency   "$latency_ms" \
+        --arg format    "$format_guess" \
+        --arg error     "$error" \
+        '{
+            url:           $url,
+            ok:            ($ok == "true"),
+            http_code:     ($http_code | tonumber? // 0),
+            size:          ($size | tonumber? // 0),
+            content_type:  $ct,
+            remote_ip:     $rip,
+            tcp_ms:        ($tcp_ms | tonumber? // 0),
+            tls_ms:        ($tls_ms | tonumber? // 0),
+            latency_ms:    ($latency | tonumber? // 0),
+            format_guess:  $format,
+            error:         (if $error != "" then $error else null end)
+          }'
+}
+
+# Pre-flight validation. Runs DNS → TCP → TLS → HTTP → format → parse for
+# the configured subscription URL of <section>. Stops as soon as a stage
+# fails so the user sees exactly where things broke.
+subscription_validate_json() {
+    local section="$1"
+    local url ua_setting format allow_insecure ua
+    [ -z "$section" ] && { echo '{"ok":false,"error":"section required"}'; return 1; }
+
+    config_get url            "$section" "subscription_url"
+    config_get ua_setting     "$section" "subscription_user_agent" "auto"
+    config_get format         "$section" "subscription_format" "auto"
+    config_get allow_insecure "$section" "subscription_allow_insecure" "0"
+    ua="$(subscription_user_agent_for "$ua_setting" "$format")"
+
+    if [ -z "$url" ]; then
+        jq -n --arg s "$section" \
+            '{section:$s, ok:false, checks:[{stage:"config", ok:false, message:"subscription_url not set"}]}'
+        return 0
+    fi
+
+    local host port scheme
+    scheme="$(printf '%s' "$url" | awk -F'://' '{print $1}')"
+    host="$(printf '%s' "$url"   | awk -F'://' '{print $2}' | awk -F'[/?#:]' '{print $1}')"
+    port="$(printf '%s' "$url"   | awk -F'://' '{print $2}' | awk -F'[/?#]' '{print $1}' | awk -F':' 'NF>1{print $NF}')"
+    [ -z "$port" ] && case "$scheme" in
+        https) port="443" ;;
+        http)  port="80"  ;;
+        *)     port="443" ;;
+    esac
+
+    # Build up the checks array with one jq invocation per stage. Cheap
+    # since this is invoked manually by the user, not on hot paths.
+    local checks_json='[]'
+    local overall="true"
+    _vc_add() {
+        local stage="$1" ok_flag="$2" message="$3"
+        checks_json="$(printf '%s' "$checks_json" \
+            | jq --arg s "$stage" --arg o "$ok_flag" --arg m "$message" \
+                '. + [{stage:$s, ok:($o=="true"), message:$m}]')"
+        [ "$ok_flag" = "false" ] && overall="false"
+        # NB: never let the trailing `[ ]` propagate non-zero — callers
+        # commonly run with `set -e`.
+        return 0
+    }
+    _vc_emit() {
+        jq -n --arg s "$section" --argjson c "$checks_json" --arg o "$overall" \
+            '{section:$s, ok:($o=="true"), checks:$c}'
+    }
+
+    # Stage 1 — DNS
+    local ip
+    if command -v getent >/dev/null 2>&1; then
+        ip="$(getent hosts "$host" 2>/dev/null | awk 'NR==1{print $1}')"
+    fi
+    if [ -z "$ip" ] && command -v nslookup >/dev/null 2>&1; then
+        ip="$(nslookup "$host" 2>/dev/null \
+            | awk '
+                /^Name:/ { in_a=1; next }
+                in_a && /^Address[^:]*:/ {
+                    sub(/^[^:]*:[ \t]*/, "")
+                    sub(/#.*/, "")
+                    print
+                    exit
+                }')"
+    fi
+    if [ -n "$ip" ]; then
+        _vc_add "dns" "true"  "$host → $ip"
+    else
+        _vc_add "dns" "false" "Cannot resolve $host"
+        _vc_emit
+        return 0
+    fi
+
+    # Stage 2+3+4 — TCP / TLS / HTTP via single curl HEAD
+    local extra=""
+    [ "$allow_insecure" = "1" ] && extra="-k"
+    local out rc tc tac http_code
+    # shellcheck disable=SC2086
+    out="$(curl -sS $extra --connect-timeout 8 --max-time 15 -o /dev/null \
+        -w 'tc=%{time_connect}\ntac=%{time_appconnect}\ncode=%{http_code}\n' \
+        -I -A "$ua" "$url" 2>/dev/null)"
+    rc=$?
+    tc="$(printf '%s\n' "$out"  | sed -n 's/^tc=//p')"
+    tac="$(printf '%s\n' "$out" | sed -n 's/^tac=//p')"
+    http_code="$(printf '%s\n' "$out" | sed -n 's/^code=//p')"
+
+    if [ "$rc" -eq 0 ] && [ "$(awk -v v="$tc" 'BEGIN{print (v>0)}')" = "1" ]; then
+        local ms; ms="$(awk -v v="$tc" 'BEGIN{print int(v*1000)}')"
+        _vc_add "tcp" "true" "Connected in ${ms} ms"
+    else
+        _vc_add "tcp" "false" "TCP connect failed (curl exit $rc)"
+        _vc_emit
+        return 0
+    fi
+
+    case "$scheme" in
+        https)
+            if [ "$rc" -eq 0 ] && [ "$(awk -v v="$tac" 'BEGIN{print (v>0)}')" = "1" ]; then
+                local ms; ms="$(awk -v v="$tac" 'BEGIN{print int(v*1000)}')"
+                local note="${ms} ms"
+                [ "$allow_insecure" = "1" ] && note="${ms} ms (insecure mode)"
+                _vc_add "tls" "true" "$note"
+            else
+                local note="TLS handshake failed"
+                [ "$allow_insecure" != "1" ] && note="$note (try Allow Insecure?)"
+                _vc_add "tls" "false" "$note"
+                _vc_emit
+                return 0
+            fi
+            ;;
+    esac
+
+    case "$http_code" in
+        2*) _vc_add "http" "true"  "HTTP $http_code" ;;
+        '') _vc_add "http" "false" "No HTTP response (curl exit $rc)" ;;
+        *)  _vc_add "http" "false" "HTTP $http_code" ;;
+    esac
+    if [ "$overall" = "false" ]; then
+        _vc_emit
+        return 0
+    fi
+
+    # Stage 5+6 — fetch full body, detect format, parse
+    local body actual_format count parsed_tmp
+    # shellcheck disable=SC2086
+    body="$(curl -fsS $extra --max-time 30 -A "$ua" "$url" 2>/dev/null)"
+    if [ -z "$body" ]; then
+        _vc_add "format" "false" "Empty response body"
+        _vc_emit
+        return 0
+    fi
+    if [ "$format" = "auto" ] || [ -z "$format" ]; then
+        actual_format="$(subscription_detect_format "$body")"
+    else
+        actual_format="$format"
+    fi
+    _vc_add "format" "true" "Detected: $actual_format"
+
+    parsed_tmp="$(mktemp 2>/dev/null || echo "/tmp/podkop-parse-$$.tmp")"
+    if subscription_parse "$body" "$actual_format" > "$parsed_tmp" 2>/dev/null; then
+        count="$(wc -l < "$parsed_tmp" | tr -d ' ')"
+        [ -z "$count" ] && count="0"
+        if [ "$count" -gt 0 ]; then
+            _vc_add "parse" "true"  "$count profiles parsed"
+        else
+            _vc_add "parse" "false" "Body parsed but 0 profiles found"
+        fi
+    else
+        _vc_add "parse" "false" "Parse step failed"
+    fi
+    rm -f "$parsed_tmp"
+
+    _vc_emit
+}
+
+# Latency for each filtered profile, queried via the local Clash API.
+# By default reads cached history (no probing) — fast, cheap, ~1 RTT each.
+# Pass force=1 (second arg) to actively re-probe through Clash, which
+# spends ~3 s per stuck server.
+subscription_latency_json() {
+    local section="$1"
+    local force="${2:-0}"
+    local parsed includes excludes line tag i probe_url
+    parsed="$(subscription_cache_path_parsed "$section")"
+
+    [ -r "$parsed" ] || { echo "[]"; return 0; }
+
+    config_get probe_url "$section" "urltest_testing_url" \
+        "https://www.gstatic.com/generate_204"
+
+    includes="$(subscription_collect_list "$section" "subscription_filters")"
+    excludes="$(subscription_collect_list "$section" "subscription_exclude")"
+
+    local tmpfile
+    tmpfile="$(mktemp)"
+    subscription_apply_filter "$parsed" "$includes" "$excludes" > "$tmpfile"
+
+    local base="${CLASH_API_BASE:-http://127.0.0.1:9090}"
+    local result_file
+    result_file="$(mktemp)"
+    : > "$result_file"
+
+    i=1
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        tag="$section-$i"
+        i=$((i + 1))
+
+        local raw_tag
+        raw_tag="$(subscription_line_get_tag "$line")"
+
+        local delay=""
+        if [ "$force" = "1" ]; then
+            local response
+            response="$(curl -fsS --max-time 8 \
+                "$base/proxies/$tag/delay?timeout=3000&url=$probe_url" \
+                2>/dev/null)"
+            delay="$(printf '%s' "$response" \
+                | jq -r '.delay // empty' 2>/dev/null)"
+        else
+            local response
+            response="$(curl -fsS --max-time 3 \
+                "$base/proxies/$tag" 2>/dev/null)"
+            delay="$(printf '%s' "$response" \
+                | jq -r '.history // [] | map(.delay) | last // empty' \
+                    2>/dev/null)"
+        fi
+        # Treat empty/null/0 as "no data".
+        case "$delay" in
+            ''|null|0) delay="" ;;
+        esac
+
+        # Tab-separated raw record; jq converts to JSON below.
+        printf '%s\t%s\t%s\n' "$tag" "$raw_tag" "$delay" >> "$result_file"
+    done < "$tmpfile"
+    rm -f "$tmpfile"
+
+    jq -R -s '
+        split("\n")
+        | map(select(. != ""))
+        | map(split("\t"))
+        | map({
+            tag:     .[0],
+            raw_tag: .[1],
+            latency: (if (.[2] // "") == "" then null else (.[2] | tonumber? // null) end)
+          })
+    ' < "$result_file"
+    rm -f "$result_file"
 }
 
 # vim: ft=sh ts=4 sw=4 et

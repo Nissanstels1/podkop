@@ -235,6 +235,116 @@ function createSectionContent(section) {
     return v.valid ? true : v.message;
   };
 
+  // "Test connection" button — sanity-checks the URL currently typed into
+  // the form WITHOUT saving. Calls /usr/bin/podkop subscription_test_url
+  // which performs an HTTP HEAD with timing + format guess.
+  o = section.option(
+    form.Button,
+    "_subscription_test_url_button",
+    _("Test connection"),
+    _(
+      "Probe the URL above (without saving) — DNS, TCP, TLS handshake, HTTP code, body format. Useful to sanity-check a fresh subscription before clicking 'Save & Apply'.",
+    ),
+  );
+  o.depends("proxy_config_type", "subscription");
+  o.inputstyle = "action";
+  o.onclick = function (ev, section_id) {
+    const url = (this.section.formvalue(section_id, "subscription_url") || "")
+      .trim();
+    const allowInsecure =
+      this.section.formvalue(section_id, "subscription_allow_insecure") === "1"
+        ? "1"
+        : "0";
+
+    if (!url) {
+      ui.addNotification(
+        null,
+        E("p", {}, _("Set a subscription URL above first.")),
+        "warning",
+      );
+      return;
+    }
+
+    const btn = ev.currentTarget;
+    btn.disabled = true;
+    const oldText = btn.innerHTML;
+    btn.innerHTML = _("Testing…");
+
+    return fs
+      .exec("/usr/bin/podkop", [
+        "subscription_test_url",
+        url,
+        allowInsecure,
+        "podkop",
+      ])
+      .then(function (res) {
+        let info;
+        try {
+          info = JSON.parse(res.stdout || "{}");
+        } catch (e) {
+          throw new Error(_("Cannot parse podkop response: %s").format(e));
+        }
+
+        const lines = [];
+        if (info.ok) {
+          lines.push(
+            E(
+              "p",
+              {},
+              _("HTTP %d · %d bytes · %d ms · format: %s").format(
+                info.http_code || 0,
+                info.size || 0,
+                info.latency_ms || 0,
+                info.format_guess || "?",
+              ),
+            ),
+          );
+        } else {
+          lines.push(
+            E(
+              "p",
+              {},
+              _("Failed: %s (HTTP %d)").format(
+                info.error || _("unknown error"),
+                info.http_code || 0,
+              ),
+            ),
+          );
+        }
+        if (info.remote_ip) {
+          lines.push(
+            E("p", {}, _("Resolved to: %s").format(info.remote_ip)),
+          );
+        }
+        if (info.tls_ms && info.tls_ms > 0) {
+          lines.push(
+            E(
+              "p",
+              {},
+              _("TLS handshake: %d ms").format(info.tls_ms),
+            ),
+          );
+        }
+
+        ui.addNotification(
+          null,
+          E("div", {}, lines),
+          info.ok ? "info" : "danger",
+        );
+      })
+      .catch(function (err) {
+        ui.addNotification(
+          null,
+          E("p", {}, _("Error: %s").format(err.message || err)),
+          "danger",
+        );
+      })
+      .finally(function () {
+        btn.disabled = false;
+        btn.innerHTML = oldText;
+      });
+  };
+
   o = section.option(
     form.DynamicList,
     "subscription_url_fallback",
@@ -387,7 +497,64 @@ function createSectionContent(section) {
       btn.innerHTML = _("Update subscription now");
     };
     btn.disabled = true;
-    btn.innerHTML = _("Fetching…");
+    btn.innerHTML = _("Starting…");
+
+    // Translate raw stage IDs from /usr/bin/podkop subscription_progress
+    // into human-friendly labels. We deliberately keep the labels short so
+    // the button text doesn't wrap on narrow displays.
+    const STAGE_LABELS = {
+      start: _("Starting…"),
+      fetching: _("Fetching…"),
+      fetch_retry: _("Trying fallback URL…"),
+      fetched: _("Fetched"),
+      detecting: _("Detecting format…"),
+      format: _("Format detected"),
+      parsing: _("Parsing…"),
+      parsed: _("Parsed"),
+      unchanged: _("Unchanged"),
+      done: _("Done"),
+      error: _("Error"),
+    };
+
+    // Poll subscription_progress every 350ms while the update runs.
+    // We render the most-recent stage as the button label so the user
+    // sees real progress without a separate progress bar.
+    let pollTimer = null;
+    const startPoll = function () {
+      const tick = function () {
+        fs.exec("/usr/bin/podkop", [
+          "subscription_progress",
+          section_id,
+        ])
+          .then(function (res) {
+            let info;
+            try {
+              info = JSON.parse(res.stdout || "{}");
+            } catch (e) {
+              return;
+            }
+            const stages = (info && info.stages) || [];
+            if (stages.length === 0) return;
+            const last = stages[stages.length - 1];
+            const label = STAGE_LABELS[last.stage] || last.stage;
+            const detail = last.detail ? " · " + last.detail : "";
+            btn.innerHTML = label + detail;
+          })
+          .catch(function () {
+            // Progress is best-effort; ignore poll failures.
+          });
+      };
+      tick();
+      pollTimer = window.setInterval(tick, 350);
+    };
+    const stopPoll = function () {
+      if (pollTimer !== null) {
+        window.clearInterval(pollTimer);
+        pollTimer = null;
+      }
+    };
+
+    startPoll();
 
     // Step 1: synchronous fetch + parse + cache rotation. Returns quickly.
     return fs
@@ -397,6 +564,7 @@ function createSectionContent(section) {
         "--no-reload",
       ])
       .then(function (res) {
+        stopPoll();
         if (res.code !== 0) {
           ui.addNotification(
             null,
@@ -439,13 +607,135 @@ function createSectionContent(section) {
           });
       })
       .catch(function (err) {
+        stopPoll();
         ui.addNotification(
           null,
           E("p", {}, _("Error: %s").format(err.message || err)),
           "danger",
         );
       })
-      .finally(restoreBtn);
+      .finally(function () {
+        stopPoll();
+        restoreBtn();
+      });
+  };
+
+  // "Validate subscription" — runs a multi-stage pre-flight check and
+  // displays a checklist modal so the user sees exactly which stage broke.
+  o = section.option(
+    form.Button,
+    "_subscription_validate_button",
+    _("Validate subscription"),
+    _(
+      "Run a pre-flight check on the saved subscription URL: DNS → TCP → TLS → HTTP → format → parse. Use this to debug why the subscription is failing without waiting for the next auto-update.",
+    ),
+  );
+  o.depends("proxy_config_type", "subscription");
+  o.inputstyle = "action";
+  o.onclick = function (ev, section_id) {
+    const btn = ev.currentTarget;
+    btn.disabled = true;
+    const oldText = btn.innerHTML;
+    btn.innerHTML = _("Validating…");
+
+    return fs
+      .exec("/usr/bin/podkop", ["subscription_validate", section_id])
+      .then(function (res) {
+        let info;
+        try {
+          info = JSON.parse(res.stdout || "{}");
+        } catch (e) {
+          throw new Error(_("Cannot parse podkop response"));
+        }
+
+        const checks = (info && info.checks) || [];
+        const rows = checks.map(function (c) {
+          const icon = c.ok
+            ? E(
+                "span",
+                { style: "color:#5cb85c;font-weight:bold" },
+                "✓",
+              )
+            : E(
+                "span",
+                { style: "color:#d9534f;font-weight:bold" },
+                "✗",
+              );
+          return E("tr", { class: "tr" }, [
+            E(
+              "td",
+              {
+                class: "td",
+                style: "text-align:center;width:30px;",
+              },
+              icon,
+            ),
+            E(
+              "td",
+              {
+                class: "td",
+                style:
+                  "font-family:monospace;width:90px;text-transform:uppercase;",
+              },
+              c.stage,
+            ),
+            E("td", { class: "td" }, c.message || ""),
+          ]);
+        });
+
+        const summary = info.ok
+          ? E(
+              "p",
+              { class: "alert-message success" },
+              _("All checks passed — subscription is reachable and parseable."),
+            )
+          : E(
+              "p",
+              { class: "alert-message warning" },
+              _(
+                "Validation failed at stage '%s'. Check the row marked ✗ below for details.",
+              ).format(
+                (checks.find(function (c) {
+                  return !c.ok;
+                }) || {}).stage || "?",
+              ),
+            );
+
+        ui.showModal(
+          _("Subscription validation — %s").format(section_id),
+          [
+            summary,
+            E("table", { class: "table" }, [
+              E("tr", { class: "tr table-titles" }, [
+                E("th", { class: "th" }, ""),
+                E("th", { class: "th" }, _("Stage")),
+                E("th", { class: "th" }, _("Detail")),
+              ]),
+            ].concat(rows)),
+            E("div", { class: "right" }, [
+              E(
+                "button",
+                {
+                  class: "btn",
+                  click: ui.hideModal,
+                },
+                _("Close"),
+              ),
+            ]),
+          ],
+        );
+      })
+      .catch(function (err) {
+        ui.addNotification(
+          null,
+          E("p", {}, _("Validation error: %s").format(err.message || err)),
+          "danger",
+        );
+      })
+      .finally(function () {
+        btn.disabled = false;
+        btn.innerHTML = oldText;
+      });
   };
 
   o = section.option(
@@ -453,61 +743,83 @@ function createSectionContent(section) {
     "_subscription_show_button",
     _("Show parsed profiles"),
     _(
-      "Open a list of all profiles parsed from the subscription, with a checkmark next to the ones that pass the current filter.",
+      "Open a list of all profiles parsed from the subscription, with a checkmark next to the ones that pass the current filter. Live latency, editable filters and per-server re-probing live in this modal.",
     ),
   );
   o.depends("proxy_config_type", "subscription");
   o.inputstyle = "action";
   o.onclick = function (ev, section_id) {
+    // Self-reference so we can use `o.section.formvalue(...)` inside the
+    // modal even though `this` rebinds when click handlers fire.
+    const sectionRef = this.section;
+
+    // Mirror of the shell-side filter logic. Tag matches if any
+    // `|`-separated token of any include entry is a substring of the tag.
+    // Empty include list -> always include.
+    const matchInclude = function (tag, entries) {
+      if (!entries || entries.length === 0) return true;
+      for (let i = 0; i < entries.length; i++) {
+        const entry = entries[i];
+        if (!entry) continue;
+        const tokens = String(entry).split("|");
+        for (let j = 0; j < tokens.length; j++) {
+          const tok = tokens[j];
+          if (tok && String(tag).indexOf(tok) >= 0) return true;
+        }
+      }
+      return false;
+    };
+    const matchExclude = function (tag, entries) {
+      if (!entries || entries.length === 0) return false;
+      return matchInclude(tag, entries);
+    };
+
+    // Pull *current* (possibly unsaved) filter values from the form so the
+    // modal reflects what the user is editing right now, not just what is
+    // saved on disk.
+    const currentIncludes = function () {
+      const v = sectionRef.formvalue(section_id, "subscription_filters");
+      return Array.isArray(v) ? v.filter(Boolean) : v ? [v] : [];
+    };
+    const currentExcludes = function () {
+      const v = sectionRef.formvalue(section_id, "subscription_exclude");
+      return Array.isArray(v) ? v.filter(Boolean) : v ? [v] : [];
+    };
+
+    const latencyClass = function (ms) {
+      if (ms == null) return "color:#888";
+      if (ms < 100) return "color:#5cb85c;font-weight:bold";
+      if (ms < 300) return "color:#f0ad4e;font-weight:bold";
+      return "color:#d9534f;font-weight:bold";
+    };
+    const latencyText = function (ms) {
+      if (ms == null) return "—";
+      return String(ms) + " ms";
+    };
+
     return Promise.all([
       fs.exec("/usr/bin/podkop", ["subscription_status", section_id]),
       fs.exec("/usr/bin/podkop", ["subscription_list", section_id]),
+      fs.exec("/usr/bin/podkop", ["subscription_latency", section_id, "0"]),
     ])
       .then(function (results) {
         const status = JSON.parse(results[0].stdout || "{}");
         const list = JSON.parse(results[1].stdout || "[]");
+        let latency;
+        try {
+          latency = JSON.parse(results[2].stdout || "[]");
+        } catch (e) {
+          latency = [];
+        }
+        // Map raw_tag -> latency for quick join.
+        const latencyByTag = {};
+        for (let i = 0; i < latency.length; i++) {
+          latencyByTag[latency[i].raw_tag] = latency[i].latency;
+        }
 
         const lastUpdate = status.last_update
           ? new Date(status.last_update * 1000).toLocaleString()
           : _("never");
-
-        const rows = list.map(function (it) {
-          return E("tr", { class: "tr" }, [
-            E(
-              "td",
-              { class: "td", style: "text-align:center" },
-              it.matched ? "✓" : "",
-            ),
-            E(
-              "td",
-              { class: "td", style: "font-family:monospace" },
-              it.tag || "-",
-            ),
-            E(
-              "td",
-              { class: "td" },
-              it.kind === "json" ? it.type || "json" : "url",
-            ),
-            E(
-              "td",
-              { class: "td", style: "font-family:monospace" },
-              it.endpoint || "-",
-            ),
-          ]);
-        });
-
-        const table = E(
-          "table",
-          { class: "table" },
-          [
-            E("tr", { class: "tr table-titles" }, [
-              E("th", { class: "th" }, _("Match")),
-              E("th", { class: "th" }, _("Tag")),
-              E("th", { class: "th" }, _("Type")),
-              E("th", { class: "th" }, _("Endpoint")),
-            ]),
-          ].concat(rows),
-        );
 
         const headerChildren = [
           E("strong", {}, _("Status:") + " "),
@@ -518,12 +830,13 @@ function createSectionContent(section) {
           " · ",
           E("strong", {}, _("Last update:") + " "),
           lastUpdate,
+        ];
+        const matchedSpan = E("span", {}, "");
+        headerChildren.push(
           " · ",
           E("strong", {}, _("Filtered:") + " "),
-          String(status.filtered || 0),
-          " / ",
-          String(status.total || 0),
-        ];
+          matchedSpan,
+        );
         if (status.fallback_in_use) {
           headerChildren.push(
             " · ",
@@ -553,9 +866,213 @@ function createSectionContent(section) {
           );
         }
 
+        // ---- Live filter editor ------------------------------------
+        // Two text fields prefilled from the form. Edits are debounced
+        // and re-evaluate `matched` client-side without hitting the
+        // backend. Saving the form is a separate concern.
+        const includesInput = E("input", {
+          type: "text",
+          placeholder: "NL|DE|FI",
+          style: "font-family:monospace;width:100%;box-sizing:border-box;",
+          value: currentIncludes().join(","),
+        });
+        const excludesInput = E("input", {
+          type: "text",
+          placeholder: "expired|trial",
+          style: "font-family:monospace;width:100%;box-sizing:border-box;",
+          value: currentExcludes().join(","),
+        });
+
+        const tableBody = E("tbody", {}, []);
+
+        const renderRows = function () {
+          const incEntries = (includesInput.value || "")
+            .split(",")
+            .map(function (s) {
+              return s.trim();
+            })
+            .filter(Boolean);
+          const excEntries = (excludesInput.value || "")
+            .split(",")
+            .map(function (s) {
+              return s.trim();
+            })
+            .filter(Boolean);
+
+          let matchedCount = 0;
+          const rows = list.map(function (it) {
+            const isMatch =
+              matchInclude(it.tag || "", incEntries) &&
+              !matchExclude(it.tag || "", excEntries);
+            if (isMatch) matchedCount++;
+            const ms = latencyByTag.hasOwnProperty(it.tag)
+              ? latencyByTag[it.tag]
+              : null;
+            return E(
+              "tr",
+              {
+                class: "tr",
+                style: isMatch ? "" : "opacity:0.55",
+              },
+              [
+                E(
+                  "td",
+                  { class: "td", style: "text-align:center;width:32px;" },
+                  isMatch ? "✓" : "",
+                ),
+                E(
+                  "td",
+                  { class: "td", style: "font-family:monospace;" },
+                  it.tag || "-",
+                ),
+                E(
+                  "td",
+                  { class: "td", style: "width:80px;" },
+                  it.kind === "json" ? it.type || "json" : "url",
+                ),
+                E(
+                  "td",
+                  { class: "td", style: "font-family:monospace;" },
+                  it.endpoint || "-",
+                ),
+                E(
+                  "td",
+                  {
+                    class: "td",
+                    style:
+                      "text-align:right;font-family:monospace;width:90px;" +
+                      latencyClass(ms),
+                  },
+                  latencyText(ms),
+                ),
+              ],
+            );
+          });
+
+          // Repaint matchedCount in header.
+          while (matchedSpan.firstChild) {
+            matchedSpan.removeChild(matchedSpan.firstChild);
+          }
+          matchedSpan.appendChild(
+            document.createTextNode(
+              String(matchedCount) + " / " + String(list.length),
+            ),
+          );
+
+          // Repaint table body.
+          while (tableBody.firstChild) {
+            tableBody.removeChild(tableBody.firstChild);
+          }
+          rows.forEach(function (r) {
+            tableBody.appendChild(r);
+          });
+        };
+
+        // Debounce keystrokes so we don't redraw on every char.
+        let debounceTimer = null;
+        const onFilterEdit = function () {
+          if (debounceTimer !== null) window.clearTimeout(debounceTimer);
+          debounceTimer = window.setTimeout(renderRows, 120);
+        };
+        includesInput.addEventListener("input", onFilterEdit);
+        excludesInput.addEventListener("input", onFilterEdit);
+
+        const filterPanel = E(
+          "div",
+          {
+            style:
+              "display:grid;grid-template-columns:140px 1fr;gap:6px 12px;align-items:center;margin:8px 0;",
+          },
+          [
+            E(
+              "label",
+              { style: "font-weight:bold;" },
+              _("Include filter (csv)"),
+            ),
+            includesInput,
+            E(
+              "label",
+              { style: "font-weight:bold;" },
+              _("Exclude filter (csv)"),
+            ),
+            excludesInput,
+            E("div", {}, ""),
+            E(
+              "div",
+              { class: "cbi-value-description" },
+              _(
+                "Edits are applied live in this modal only. Save & Apply to persist them. Use ',' between entries; '|' inside one entry means OR.",
+              ),
+            ),
+          ],
+        );
+
+        // ---- Latency re-probe button -------------------------------
+        const reprobeBtn = E(
+          "button",
+          {
+            class: "btn",
+            style: "margin-right:6px;",
+          },
+          _("Re-probe latency"),
+        );
+        reprobeBtn.addEventListener("click", function () {
+          reprobeBtn.disabled = true;
+          const oldText = reprobeBtn.innerHTML;
+          reprobeBtn.innerHTML = _("Probing…");
+          fs.exec("/usr/bin/podkop", [
+            "subscription_latency",
+            section_id,
+            "1",
+          ])
+            .then(function (res) {
+              let fresh;
+              try {
+                fresh = JSON.parse(res.stdout || "[]");
+              } catch (e) {
+                fresh = [];
+              }
+              for (let i = 0; i < fresh.length; i++) {
+                latencyByTag[fresh[i].raw_tag] = fresh[i].latency;
+              }
+              renderRows();
+            })
+            .catch(function () {
+              ui.addNotification(
+                null,
+                E("p", {}, _("Re-probe failed; is sing-box running?")),
+                "warning",
+              );
+            })
+            .finally(function () {
+              reprobeBtn.disabled = false;
+              reprobeBtn.innerHTML = oldText;
+            });
+        });
+
+        const tableEl = E("table", { class: "table" }, [
+          E("thead", {}, [
+            E("tr", { class: "tr table-titles" }, [
+              E("th", { class: "th" }, _("Match")),
+              E("th", { class: "th" }, _("Tag")),
+              E("th", { class: "th" }, _("Type")),
+              E("th", { class: "th" }, _("Endpoint")),
+              E(
+                "th",
+                { class: "th", style: "text-align:right;" },
+                _("Latency"),
+              ),
+            ]),
+          ]),
+          tableBody,
+        ]);
+
+        renderRows();
+
         ui.showModal(_("Subscription profiles — %s").format(section_id), [
           E("p", {}, headerChildren),
-          rows.length === 0
+          filterPanel,
+          list.length === 0
             ? E(
                 "p",
                 { class: "alert-message warning" },
@@ -563,8 +1080,9 @@ function createSectionContent(section) {
                   "No profiles parsed yet. Click 'Update subscription now' first.",
                 ),
               )
-            : table,
+            : tableEl,
           E("div", { class: "right" }, [
+            reprobeBtn,
             E(
               "button",
               {

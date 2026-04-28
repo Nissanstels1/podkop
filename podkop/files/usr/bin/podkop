@@ -3006,6 +3006,49 @@ subscription_list_cli() {
     subscription_list_json "$target"
 }
 
+subscription_progress_cli() {
+    local target="$1"
+    if [ -z "$target" ]; then
+        echo "Usage: $0 subscription_progress <section>" >&2
+        return 2
+    fi
+    subscription_progress_json "$target"
+}
+
+subscription_validate_cli() {
+    local target="$1"
+    if [ -z "$target" ]; then
+        echo "Usage: $0 subscription_validate <section>" >&2
+        return 2
+    fi
+    subscription_validate_json "$target"
+}
+
+# Test an arbitrary URL without touching cache or saved config.
+# Args: <url> [allow_insecure 0|1] [user_agent]
+subscription_test_url_cli() {
+    local url="$1"
+    local insecure="${2:-0}"
+    local ua="${3:-podkop}"
+    if [ -z "$url" ]; then
+        echo "Usage: $0 subscription_test_url <url> [allow_insecure 0|1] [user_agent]" >&2
+        return 2
+    fi
+    subscription_test_url_json "$url" "$ua" "$insecure"
+}
+
+# Latency for filtered profiles (cached history by default).
+# Args: <section> [force 0|1]
+subscription_latency_cli() {
+    local target="$1"
+    local force="${2:-0}"
+    if [ -z "$target" ]; then
+        echo "Usage: $0 subscription_latency <section> [force 0|1]" >&2
+        return 2
+    fi
+    subscription_latency_json "$target" "$force"
+}
+
 show_help() {
     cat << EOF
 Usage: $0 COMMAND
@@ -3040,6 +3083,23 @@ Available commands:
     subscription_stuck <section>
                             Print JSON array of currently-stuck profile tags
                             for the given section.
+    subscription_progress <section>
+                            Print JSON list of progress stages emitted by the
+                            most recent subscription_update of <section>.
+                            Used by the LuCI progress bar.
+    subscription_validate <section>
+                            Pre-flight test of the configured subscription URL
+                            (DNS → TCP → TLS → HTTP → format → parse). Prints
+                            JSON checklist; never touches the cache.
+    subscription_test_url <url> [allow_insecure 0|1] [user_agent]
+                            Quick connectivity test of an arbitrary URL.
+                            Returns JSON with HTTP code, sizes, latency and
+                            detected format. Used by the 'Test connection'
+                            button next to the URL field.
+    subscription_latency <section> [force 0|1]
+                            JSON latency for each filtered profile, queried
+                            via the local Clash API. With force=1 actively
+                            re-probes; default uses cached delay history.
     check_proxy             Check proxy connectivity
     check_nft               Check NFT rules
     check_nft_rules         Check NFT rules status
@@ -3098,6 +3158,18 @@ subscription_list)
     ;;
 subscription_stuck)
     subscription_stuck_cli "$2"
+    ;;
+subscription_progress)
+    subscription_progress_cli "$2"
+    ;;
+subscription_validate)
+    subscription_validate_cli "$2"
+    ;;
+subscription_test_url)
+    subscription_test_url_cli "$2" "$3" "$4"
+    ;;
+subscription_latency)
+    subscription_latency_cli "$2" "$3"
     ;;
 check_proxy)
     check_proxy
