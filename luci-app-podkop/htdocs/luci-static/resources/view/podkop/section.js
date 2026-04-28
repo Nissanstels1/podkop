@@ -886,18 +886,22 @@ function createSectionContent(section) {
         );
         return;
       }
-      const flag = tagToFlagLocal(info.raw_tag || info.active_tag || "");
+      const rawText = info.raw_tag || info.active_tag || "-";
+      const flag = tagToFlagLocal(rawText);
+      const cleanText =
+        rawText
+          .replace(
+            /^(?:[\uD83C][\uDDE6-\uDDFF][\uD83C][\uDDE6-\uDDFF]\s*)+/,
+            "",
+          )
+          .trim() || rawText;
       card.appendChild(E("div", {}, _("Active:")));
       card.appendChild(
         E("div", { style: "font-size:1.1em;" }, [
           flag
             ? E("span", { style: "margin-right:6px;font-size:1.2em;" }, flag)
             : "",
-          E(
-            "strong",
-            {},
-            info.raw_tag || info.active_tag || "-",
-          ),
+          E("strong", {}, cleanText),
         ]),
       );
       if (info.endpoint) {
@@ -1276,7 +1280,15 @@ function createSectionContent(section) {
                 ),
               );
             }
-            tagCell.appendChild(document.createTextNode(it.tag || "-"));
+            // Strip any leading emoji flag(s) + whitespace from the displayed tag
+            // so we don't render the flag twice when the tag already has one.
+            const tagText = (it.tag || "-")
+              .replace(
+                /^(?:[\uD83C][\uDDE6-\uDDFF][\uD83C][\uDDE6-\uDDFF]\s*)+/,
+                "",
+              )
+              .trim() || (it.tag || "-");
+            tagCell.appendChild(document.createTextNode(tagText));
             const latencyCell = E(
               "td",
               {
