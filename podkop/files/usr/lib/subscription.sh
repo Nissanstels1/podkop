@@ -1013,7 +1013,11 @@ subscription_resolve_interval() {
             ;;
     esac
 
-    [ -z "$current" ] && current="1h"
+    if [ -z "$current" ]; then
+        # No prior tier recorded → baseline.
+        printf '1h'
+        return 0
+    fi
 
     if [ "$streak" -ge 7 ]; then
         # Coarsen.

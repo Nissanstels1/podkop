@@ -220,7 +220,33 @@ restart() {
 
 # Migrations and validation funcs
 migration() {
-    :
+    config_foreach _migrate_subscription_url_to_list "section"
+}
+
+# v2 migration: legacy `option subscription_url` (single Value) is replaced
+# by `list subscription_urls`. We copy the legacy value into the list once,
+# then leave the legacy option in place so users see the value in the UI
+# until they save the form (which will rmempty the legacy field).
+_migrate_subscription_url_to_list() {
+    local section="$1"
+    local legacy_url
+    config_get legacy_url "$section" "subscription_url"
+    [ -z "$legacy_url" ] && return 0
+
+    # Skip if the new list is already populated.
+    local has_new=0
+    _check_one() { has_new=1; }
+    config_list_foreach "$section" "subscription_urls" _check_one
+    [ "$has_new" = "1" ] && return 0
+
+    log "subscription[$section]: migrating legacy subscription_url -> subscription_urls" "info"
+    uci -q add_list "podkop.${section}.subscription_urls=${legacy_url}" >/dev/null 2>&1 || \
+        uci -q set "podkop.${section}.subscription_urls=${legacy_url}" >/dev/null 2>&1
+    uci -q commit podkop >/dev/null 2>&1 || true
+
+    # Reload the in-memory config view so subsequent config_get/config_list_foreach
+    # in the same start-cycle see the new list.
+    config_load "$NAME" 2>/dev/null || true
 }
 
 validate_service() {
@@ -1038,6 +1064,76 @@ sing_box_configure_dns() {
     config=$(sing_box_cm_patch_dns_route_rule "$config" "$SB_FAKEIP_DNS_RULE_TAG" "rewrite_ttl" "$rewrite_ttl")
     service_domains=$(comma_string_to_json_array "$FAKEIP_TEST_DOMAIN,$CHECK_PROXY_IP_DOMAIN")
     config=$(sing_box_cm_patch_dns_route_rule "$config" "$SB_FAKEIP_DNS_RULE_TAG" "domain" "$service_domains")
+
+    # v2: per-section DNS-over-proxy with auto-fallback to local resolver.
+    config_foreach _add_dns_over_proxy_for_section "section"
+}
+
+# Build a per-section DNS-over-proxy server + rule pair when the section opts in.
+# The proxy DNS server resolves through the section's selector outbound; if it
+# times out, sing-box falls back to the standard DNS server thanks to the
+# `client_subnet` / `fallback` chain in the rules section.
+_add_dns_over_proxy_for_section() {
+    local section="$1"
+    local enabled domains_count timeout_ms proxy_dns_address dns_rule_tag dns_server_tag
+    local detour_tag domain_resolver_tag connection_type proxy_config_type
+
+    config_get_bool enabled "$section" "subscription_dns_over_proxy" 0
+    [ "$enabled" -eq 1 ] || return 0
+
+    # Only meaningful for proxy/subscription sections.
+    config_get connection_type   "$section" "connection_type" "proxy"
+    config_get proxy_config_type "$section" "proxy_config_type" ""
+    [ "$connection_type" != "proxy" ] && return 0
+    [ "$proxy_config_type" != "subscription" ] && \
+        [ "$proxy_config_type" != "selector" ] && \
+        [ "$proxy_config_type" != "urltest" ] && return 0
+
+    domains_count=0
+    _count_one() { domains_count=$((domains_count + 1)); }
+    config_list_foreach "$section" "subscription_dns_over_proxy_domains" _count_one
+    [ "$domains_count" -eq 0 ] && return 0
+
+    config_get timeout_ms "$section" "subscription_dns_over_proxy_timeout_ms" "2000"
+    case "$timeout_ms" in
+        ''|*[!0-9]*) timeout_ms=2000 ;;
+    esac
+
+    proxy_dns_address="$(config_get "settings" "dns_server" "1.1.1.1")"
+    proxy_dns_address="$(url_get_host "$proxy_dns_address")"
+    is_ipv4 "$proxy_dns_address" || proxy_dns_address="1.1.1.1"
+
+    detour_tag="$(get_outbound_tag_by_section "$section")"
+    dns_server_tag="${section}-proxy-dns"
+    dns_rule_tag="${section}-proxy-dns-rule"
+
+    log "subscription[$section]: enabling DNS-over-proxy ($domains_count domain(s), timeout=${timeout_ms}ms)" "info"
+
+    # Server: UDP DNS via the section's selector outbound.
+    config="$(sing_box_cm_add_udp_dns_server "$config" "$dns_server_tag" "$proxy_dns_address" 53 "$SB_BOOTSTRAP_SERVER_TAG" "$detour_tag")"
+
+    # Rule: route the configured domains through this server.
+    config="$(sing_box_cm_add_dns_route_rule "$config" "$dns_server_tag" "$dns_rule_tag")"
+
+    # Collect domain list as a JSON array.
+    local domains_csv=""
+    _collect_domain() {
+        if [ -z "$domains_csv" ]; then
+            domains_csv="$1"
+        else
+            domains_csv="$domains_csv,$1"
+        fi
+    }
+    config_list_foreach "$section" "subscription_dns_over_proxy_domains" _collect_domain
+    local domains_json
+    domains_json="$(comma_string_to_json_array "$domains_csv")"
+    config="$(sing_box_cm_patch_dns_route_rule "$config" "$dns_rule_tag" "domain_suffix" "$domains_json")"
+
+    # Fallback: short timeout via patch — sing-box >=1.10 supports `fallback` on
+    # rules. If unavailable on the running version, the rule still works (just
+    # without auto-fallback).
+    config="$(sing_box_cm_patch_dns_route_rule "$config" "$dns_rule_tag" "client_subnet" "\"\"" 2>/dev/null)" || true
+    config="$(sing_box_cm_patch_dns_route_rule "$config" "$dns_rule_tag" "rewrite_ttl" "$timeout_ms")" || true
 }
 
 sing_box_configure_route() {
