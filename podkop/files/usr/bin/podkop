@@ -499,14 +499,29 @@ subscription_remove_cron_jobs() {
 
 subscription_add_cron_job() {
     local section="$1"
-    local subscription_url subscription_update_interval cron_expr cron_line existing
+    local subscription_update_interval cron_expr cron_line latency_cron pool_cron \
+        sub_urls_count effective_interval prev_meta tier streak
 
-    config_get subscription_url             "$section" "subscription_url"
+    sub_urls_count="$(subscription_collect_urls "$section" | grep -c '.' || true)"
+    [ -z "$sub_urls_count" ] || [ "$sub_urls_count" = "0" ] && return 0
+
     config_get subscription_update_interval "$section" "subscription_update_interval" "1h"
 
-    [ -z "$subscription_url" ] && return 0
-
+    # If "auto", derive the active tier from cached meta. Falls back to 1h.
     case "$subscription_update_interval" in
+        auto)
+            prev_meta="$(subscription_meta_read "$(subscription_cache_path_meta "$section")")"
+            tier="$(printf '%s' "$prev_meta" | awk -F'\t' '{print $7}')"
+            streak="$(printf '%s' "$prev_meta" | awk -F'\t' '{print $6}')"
+            effective_interval="$(subscription_resolve_interval "$section" "${streak:-0}" "${tier:-1h}")"
+            log "subscription[$section]: auto interval resolved to $effective_interval (streak=${streak:-0}, tier=${tier:-1h})" "info"
+            ;;
+        *)
+            effective_interval="$subscription_update_interval"
+            ;;
+    esac
+
+    case "$effective_interval" in
         "10m")  cron_expr="*/10 * * * *" ;;
         "1h")   cron_expr="13 * * * *" ;;
         "6h")   cron_expr="13 */6 * * *" ;;
@@ -516,19 +531,44 @@ subscription_add_cron_job() {
             return 0
             ;;
         *)
-            log "subscription[$section]: invalid update interval '$subscription_update_interval', defaulting to 1h" "warn"
+            log "subscription[$section]: invalid update interval '$effective_interval', defaulting to 1h" "warn"
             cron_expr="13 * * * *"
             ;;
     esac
 
     cron_line="$cron_expr /usr/bin/podkop subscription_update $section # podkop-subscription:$section"
 
-    # Drop any existing line for this section first.
+    # Latency collector: every 5 minutes when ping-range or pool-split features
+    # are actually used. Otherwise skip — sing-box has its own urltest.
+    local ping_min ping_max pool_split
+    config_get ping_min   "$section" "subscription_ping_min"  "0"
+    config_get ping_max   "$section" "subscription_ping_max"  "0"
+    config_get pool_split "$section" "subscription_pool_split" "0"
+    latency_cron=""
+    if [ "$pool_split" = "1" ] || \
+       { [ -n "$ping_min" ] && [ "$ping_min" != "0" ]; } || \
+       { [ -n "$ping_max" ] && [ "$ping_max" != "0" ]; }; then
+        latency_cron="*/5 * * * * /usr/bin/podkop subscription_collect_latency $section # podkop-subscription:$section"
+    fi
+
+    # Pool watchdog: every minute, only when pool-split is on.
+    pool_cron=""
+    if [ "$pool_split" = "1" ]; then
+        pool_cron="* * * * * /usr/bin/podkop subscription_pool_watchdog $section # podkop-subscription:$section"
+    fi
+
+    # Drop any existing lines for this section first.
     subscription_remove_cron_jobs "$section"
 
-    # Append.
-    (crontab -l 2>/dev/null; echo "$cron_line") | crontab -
-    log "subscription[$section]: cron set ($cron_expr)"
+    # Append all jobs in one crontab rewrite.
+    {
+        crontab -l 2>/dev/null
+        echo "$cron_line"
+        [ -n "$latency_cron" ] && echo "$latency_cron"
+        [ -n "$pool_cron" ]    && echo "$pool_cron"
+    } | crontab -
+
+    log "subscription[$section]: cron set ($cron_expr$( [ -n "$latency_cron" ] && echo '; +latency'; [ -n "$pool_cron" ] && echo '; +watchdog'))"
 }
 
 subscription_install_all_cron_jobs() {
@@ -771,19 +811,24 @@ configure_outbound_handler() {
             ;;
         subscription)
             log "Detected proxy configuration type: subscription" "debug"
-            local subscription_url subscription_mode subscription_meta_file \
+            local subscription_mode subscription_meta_file \
                 udp_over_tcp i urltest_check_interval urltest_tolerance urltest_testing_url \
-                outbound_tags outbound_tag urltest_tag selector_tag urltest_outbounds selector_outbounds \
-                kind rest filtered_count line tag_for_outbound
+                outbound_tags fast_tags slow_tags outbound_tag urltest_tag selector_tag \
+                urltest_outbounds selector_outbounds \
+                kind rest filtered_count line tag_for_outbound \
+                _sub_urls _sub_url_count subscription_pool_split fast_thresh
 
-            config_get subscription_url        "$section" "subscription_url"
             config_get subscription_mode       "$section" "subscription_mode" "urltest"
             config_get udp_over_tcp            "$section" "enable_udp_over_tcp"
             config_get urltest_check_interval  "$section" "urltest_check_interval" "3m"
             config_get urltest_tolerance       "$section" "urltest_tolerance" 50
             config_get urltest_testing_url     "$section" "urltest_testing_url" "https://www.gstatic.com/generate_204"
+            config_get subscription_pool_split "$section" "subscription_pool_split" "0"
+            config_get fast_thresh             "$section" "subscription_fast_threshold_ms" "100"
 
-            if [ -z "$subscription_url" ]; then
+            _sub_urls="$(subscription_collect_urls "$section")"
+            _sub_url_count="$(printf '%s' "$_sub_urls" | grep -c '.' || true)"
+            if [ "$_sub_url_count" -eq 0 ]; then
                 log "Subscription URL is not set for section '$section'. Aborted." "fatal"
                 exit 1
             fi
@@ -795,13 +840,21 @@ configure_outbound_handler() {
                     log "subscription[$section]: initial update failed, will reuse old cache if any" "warn"
             fi
 
+            local _latency_file
+            _latency_file="$(subscription_cache_path_latency "$section")"
+            case "$fast_thresh" in
+                ''|*[!0-9]*) fast_thresh=100 ;;
+            esac
+
             i=1
             outbound_tags=""
+            fast_tags=""
+            slow_tags=""
             filtered_count=0
             # Use a temp file because we need to consume the filtered list line-by-line.
             local _sub_tmp
             _sub_tmp="$(mktemp)"
-            subscription_load_filtered "$section" > "$_sub_tmp"
+            subscription_load_filtered "$section" all > "$_sub_tmp"
             while IFS= read -r line; do
                 [ -z "$line" ] && continue
                 kind="${line%% *}"
@@ -825,6 +878,31 @@ configure_outbound_handler() {
                 else
                     outbound_tags="$outbound_tags,$outbound_tag"
                 fi
+
+                # Pool classification (only relevant when pool-split is on).
+                if [ "$subscription_pool_split" = "1" ]; then
+                    local _profile_tag _profile_lat _profile_pool
+                    _profile_tag="$(subscription_line_get_tag "$line")"
+                    _profile_lat="$(subscription_lookup_latency "$_latency_file" "$_profile_tag")"
+                    case "$_profile_lat" in
+                        ''|*[!0-9]*) _profile_pool="fast" ;; # unknown/timeout -> fast pool
+                        *)
+                            if [ "$_profile_lat" -lt "$fast_thresh" ]; then
+                                _profile_pool="fast"
+                            else
+                                _profile_pool="slow"
+                            fi
+                            ;;
+                    esac
+                    if [ "$_profile_pool" = "fast" ]; then
+                        if [ -z "$fast_tags" ]; then fast_tags="$outbound_tag"
+                        else fast_tags="$fast_tags,$outbound_tag"; fi
+                    else
+                        if [ -z "$slow_tags" ]; then slow_tags="$outbound_tag"
+                        else slow_tags="$slow_tags,$outbound_tag"; fi
+                    fi
+                fi
+
                 i=$((i + 1))
                 filtered_count=$((filtered_count + 1))
             done < "$_sub_tmp"
@@ -839,21 +917,45 @@ configure_outbound_handler() {
             urltest_tag="$(get_outbound_tag_by_section "$section-urltest")"
             selector_tag="$(get_outbound_tag_by_section "$section")"
             urltest_outbounds="$(comma_string_to_json_array "$outbound_tags")"
-            selector_outbounds="$(comma_string_to_json_array "$outbound_tags,$urltest_tag")"
 
-            # Always create a urltest group — sing-box does the PING + auto-best-pick.
+            # Always create the all-profiles urltest group — sing-box does the
+            # PING + auto-best-pick.
             config="$(sing_box_cm_add_urltest_outbound "$config" "$urltest_tag" "$urltest_outbounds" \
                 "$urltest_testing_url" "$urltest_check_interval" "$urltest_tolerance")"
 
+            local _selector_extra_tags="" fast_tag="" slow_tag=""
+            if [ "$subscription_pool_split" = "1" ] && [ -n "$fast_tags" ] && [ -n "$slow_tags" ]; then
+                fast_tag="$(get_outbound_tag_by_section "$section-fast")"
+                slow_tag="$(get_outbound_tag_by_section "$section-slow")"
+                local fast_outbounds slow_outbounds
+                fast_outbounds="$(comma_string_to_json_array "$fast_tags")"
+                slow_outbounds="$(comma_string_to_json_array "$slow_tags")"
+
+                config="$(sing_box_cm_add_urltest_outbound "$config" "$fast_tag" "$fast_outbounds" \
+                    "$urltest_testing_url" "$urltest_check_interval" "$urltest_tolerance")"
+                config="$(sing_box_cm_add_urltest_outbound "$config" "$slow_tag" "$slow_outbounds" \
+                    "$urltest_testing_url" "$urltest_check_interval" "$urltest_tolerance")"
+
+                _selector_extra_tags="$fast_tag,$slow_tag,"
+            fi
+
+            selector_outbounds="$(comma_string_to_json_array "${_selector_extra_tags}${outbound_tags},${urltest_tag}")"
+
             # Wrap in a selector so that the user can override via Clash API/Dashboard.
-            # Default = urltest in "urltest" mode, first profile in "selector" mode.
+            # Defaults:
+            #   - subscription_mode=selector  → first individual profile
+            #   - subscription_mode=urltest   → fast pool if pool-split, else urltest
             local default_outbound
             case "$subscription_mode" in
                 selector)
                     default_outbound="${outbound_tags%%,*}"
                     ;;
                 *)
-                    default_outbound="$urltest_tag"
+                    if [ -n "$fast_tag" ]; then
+                        default_outbound="$fast_tag"
+                    else
+                        default_outbound="$urltest_tag"
+                    fi
                     ;;
             esac
             config="$(sing_box_cm_add_selector_outbound "$config" "$selector_tag" "$selector_outbounds" "$default_outbound")"
@@ -2813,12 +2915,12 @@ subscription_update_cli() {
         return "$rc"
     fi
 
-    # No target — refresh every section that has subscription_url set.
+    # No target — refresh every section that has any subscription URL set.
     _do_one() {
         local section="$1"
-        local url
-        config_get url "$section" "subscription_url"
-        [ -z "$url" ] && return 0
+        local n
+        n="$(subscription_collect_urls "$section" | grep -c '.' || true)"
+        [ -z "$n" ] || [ "$n" = "0" ] && return 0
         any=1
         subscription_update_section "$section" || rc=1
     }
@@ -2840,9 +2942,9 @@ subscription_status_cli() {
     local results=""
     _emit() {
         local section="$1"
-        local url
-        config_get url "$section" "subscription_url"
-        [ -z "$url" ] && return 0
+        local n
+        n="$(subscription_collect_urls "$section" | grep -c '.' || true)"
+        [ -z "$n" ] || [ "$n" = "0" ] && return 0
         local item
         item="$(subscription_status_json "$section")"
         if [ -z "$results" ]; then
@@ -2869,6 +2971,108 @@ subscription_list_cli() {
     subscription_list_json "$target"
 }
 
+# Refresh the per-section latency cache by calling the Clash API.
+#
+# We test the per-section urltest group (which sing-box already maintains for
+# us) — Clash API returns each member's last delay measurement. We translate
+# the sing-box outbound tag (`<section>-N`) back to the user-facing profile
+# tag stored in the parsed cache so the latency file is keyed the way the
+# UI/filter expects.
+subscription_collect_latency_cli() {
+    local target="$1"
+    if [ -z "$target" ]; then
+        echo "Usage: $0 subscription_collect_latency <section>" >&2
+        return 2
+    fi
+
+    if [ ! -r "$(subscription_cache_path_parsed "$target")" ]; then
+        log "subscription[$target]: no parsed cache, refusing to probe" "warn"
+        return 1
+    fi
+
+    local urltest_tag delay_json latency_file tmp
+    urltest_tag="$(get_outbound_tag_by_section "$target-urltest")"
+    latency_file="$(subscription_cache_path_latency "$target")"
+    tmp="${latency_file}.tmp"
+
+    delay_json="$(clash_api get_group_latency "$urltest_tag" 5000 2>/dev/null)"
+    if [ -z "$delay_json" ] || ! printf '%s' "$delay_json" \
+            | jq -e 'type == "object"' >/dev/null 2>&1; then
+        log "subscription[$target]: Clash API returned no latency data (group=$urltest_tag); is sing-box running?" "warn"
+        return 1
+    fi
+
+    : > "$tmp"
+
+    # delay_json is { "<sing-box outbound tag>": <ms or 0>, ... }.
+    # Map sing-box tag (`<section>-N`) → user-facing profile tag (Nth line of parsed file, 1-based).
+    local i=1
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        local sb_tag profile_tag ms
+        sb_tag="$(get_outbound_tag_by_section "$target-$i")"
+        profile_tag="$(subscription_line_get_tag "$line")"
+        ms="$(printf '%s' "$delay_json" | jq -r --arg t "$sb_tag" '.[$t] // empty' 2>/dev/null)"
+        if [ -n "$ms" ] && [ "$ms" != "null" ]; then
+            # Clash API uses 0 for "timeout / not yet measured" — record as -1 so
+            # the filter treats them as "ignore for now" (passthrough).
+            if [ "$ms" = "0" ]; then
+                printf '%s\t-1\n' "$profile_tag" >> "$tmp"
+            else
+                printf '%s\t%s\n' "$profile_tag" "$ms" >> "$tmp"
+            fi
+        fi
+        i=$((i + 1))
+    done < "$(subscription_cache_path_parsed "$target")"
+
+    mv "$tmp" "$latency_file"
+    log "subscription[$target]: latency cache refreshed ($(wc -l < "$latency_file" | tr -d ' ') entries)" "info"
+}
+
+# Pool watchdog: if every member of <section>-fast is dead (latency=0 or empty)
+# but <section>-slow has at least one alive member — switch the user-facing
+# selector to -slow. Reverses on the next sample where -fast has a live one.
+subscription_pool_watchdog_cli() {
+    local target="$1"
+    if [ -z "$target" ]; then
+        echo "Usage: $0 subscription_pool_watchdog <section>" >&2
+        return 2
+    fi
+
+    local pool_split
+    config_get pool_split "$target" "subscription_pool_split" "0"
+    [ "$pool_split" = "1" ] || return 0
+
+    local selector_tag fast_tag slow_tag
+    selector_tag="$(get_outbound_tag_by_section "$target")"
+    fast_tag="$(get_outbound_tag_by_section "$target-fast")"
+    slow_tag="$(get_outbound_tag_by_section "$target-slow")"
+
+    # Probe both groups in parallel — Clash returns 0 for dead members.
+    local fast_json slow_json fast_alive slow_alive
+    fast_json="$(clash_api get_group_latency "$fast_tag" 3000 2>/dev/null)"
+    slow_json="$(clash_api get_group_latency "$slow_tag" 3000 2>/dev/null)"
+
+    fast_alive="$(printf '%s' "$fast_json" | jq -r 'to_entries | map(select(.value > 0)) | length' 2>/dev/null)"
+    slow_alive="$(printf '%s' "$slow_json" | jq -r 'to_entries | map(select(.value > 0)) | length' 2>/dev/null)"
+    [ -z "$fast_alive" ] && fast_alive=0
+    [ -z "$slow_alive" ] && slow_alive=0
+
+    if [ "$fast_alive" -eq 0 ] && [ "$slow_alive" -gt 0 ]; then
+        log "subscription[$target]: fast pool dead, switching selector → slow" "warn"
+        clash_api set_group_proxy "$selector_tag" "$slow_tag" >/dev/null 2>&1 || true
+    elif [ "$fast_alive" -gt 0 ]; then
+        # Make sure we aren't stuck in slow forever.
+        local current
+        current="$(printf '%s' "$(clash_api get_proxies 2>/dev/null)" \
+            | jq -r --arg sel "$selector_tag" '.proxies[$sel].now // ""' 2>/dev/null)"
+        if [ "$current" = "$slow_tag" ]; then
+            log "subscription[$target]: fast pool recovered, switching selector → fast" "info"
+            clash_api set_group_proxy "$selector_tag" "$fast_tag" >/dev/null 2>&1 || true
+        fi
+    fi
+}
+
 show_help() {
     cat << EOF
 Usage: $0 COMMAND
@@ -2890,6 +3094,14 @@ Available commands:
     subscription_list <section>
                             Print JSON array of all parsed profiles for the
                             given section, with a 'matched' flag per row.
+    subscription_collect_latency <section>
+                            Refresh the per-section latency cache by polling
+                            the Clash API (used by ping-range filter and
+                            fast/slow pool split). Cron-driven by default.
+    subscription_pool_watchdog <section>
+                            One-shot health check for the fast/slow pool
+                            split — switches the selector to slow if every
+                            member of the fast pool is currently dead.
     check_proxy             Check proxy connectivity
     check_nft               Check NFT rules
     check_nft_rules         Check NFT rules status
@@ -2938,6 +3150,12 @@ subscription_status)
     ;;
 subscription_list)
     subscription_list_cli "$2"
+    ;;
+subscription_collect_latency)
+    subscription_collect_latency_cli "$2"
+    ;;
+subscription_pool_watchdog)
+    subscription_pool_watchdog_cli "$2"
     ;;
 check_proxy)
     check_proxy
