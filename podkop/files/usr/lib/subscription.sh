@@ -102,9 +102,18 @@ subscription_fetch() {
 
     # -fsSL: fail on HTTP errors, silent, follow redirects.
     # 30s connect, 60s total — subscription endpoints are usually slow.
-    # --compressed: transparently handle gzip/deflate (some panels return it).
+    # --compressed: transparently handle gzip/deflate when libcurl was built
+    # with zlib support. OpenWrt ships a "tiny" curl by default that does NOT
+    # link zlib (and `curl --help` still lists `--compressed`), so we probe
+    # `curl -V` for the explicit feature list — only there does the absence of
+    # zlib show up reliably. If unavailable, identity-encode the request — most
+    # subscription panels send identity-encoded bodies anyway.
+    if curl -V 2>/dev/null | grep -qiE '(^|[[:space:]])libz([[:space:]]|/|$)'; then
+        extra="$extra --compressed"
+    fi
+
     # shellcheck disable=SC2086
-    curl -fsSL --compressed $extra \
+    curl -fsSL $extra \
         --connect-timeout 30 \
         --max-time 60 \
         -A "$ua" \

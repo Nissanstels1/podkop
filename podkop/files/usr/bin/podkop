@@ -88,6 +88,7 @@ check_requirements() {
 _check_outbound_section() {
     local section="$1"
     local proxy_string interface outbound_json urltest_proxy_links subscription_url
+    local subscription_urls_count=0
 
     config_get proxy_string "$section" "proxy_string"
     config_get selector_proxy_links "$section" "selector_proxy_links"
@@ -95,9 +96,16 @@ _check_outbound_section() {
     config_get outbound_json "$section" "outbound_json"
     config_get interface "$section" "interface"
     config_get subscription_url "$section" "subscription_url"
+    # v2: count entries in the new multi-URL DynamicList. Even one entry is
+    # enough to say this section will produce outbounds at config-build time.
+    _check_outbound_section_count_url() {
+        subscription_urls_count=$((subscription_urls_count + 1))
+    }
+    config_list_foreach "$section" "subscription_urls" _check_outbound_section_count_url
 
     if [ -n "$proxy_string" ] || [ -n "$selector_proxy_links" ] || [ -n "$urltest_proxy_links" ] ||
-        [ -n "$outbound_json" ] || [ -n "$interface" ] || [ -n "$subscription_url" ]; then
+        [ -n "$outbound_json" ] || [ -n "$interface" ] || [ -n "$subscription_url" ] ||
+        [ "$subscription_urls_count" -gt 0 ]; then
         section_exists=0
     fi
 }
