@@ -217,64 +217,70 @@ function createSectionContent(section) {
 
   // ---------- Subscription ----------------------------------------------
 
-  // New (v2): multi-URL subscription pool. Backend reads both legacy
-  // `subscription_url` (single) and `subscription_urls` (list); new sections
-  // should populate this list. The init script migrates old configs on first
-  // boot after upgrade.
+  // New (v2): multi-URL subscription pool, edited as a textarea (one URL per
+  // line). We previously used form.DynamicList here, but that widget only
+  // commits a typed value when the user explicitly clicks "+" or presses
+  // Enter — pasting a URL and hitting Save was silently losing it. A textarea
+  // is the safest UX: every keystroke is part of the value. We map between the
+  // textarea contents and a UCI `list subscription_urls` so the backend reads
+  // it the same way as before. The init script migrates old `option
+  // subscription_url` configs on first boot after upgrade.
   o = section.option(
-    form.DynamicList,
+    form.TextValue,
     "subscription_urls",
     _("Subscription URLs"),
     _(
-      "One or more HTTP(S) URLs to fetch. Supported formats: sing-box JSON, " +
-        "Clash YAML, v2ray JSON, base64-encoded link lists, or plain link lists. " +
-        "All sources are merged and deduplicated by tag+endpoint. Use http:// only " +
-        "for trusted local panels — a warning will be shown.",
+      "One or more HTTP(S) URLs to fetch — one per line. Supported formats: " +
+        "sing-box JSON, Clash YAML, v2ray JSON, base64-encoded link lists, or " +
+        "plain link lists. All sources are merged and deduplicated by " +
+        "tag+endpoint. Use http:// only for trusted local panels — a warning " +
+        "will be shown.",
     ),
   );
   o.depends("proxy_config_type", "subscription");
   o.placeholder = "https://panel.example.com/sub/abc";
-  o.password = true;
-  // LuCI's DynamicList invokes this validator per-row as the user types, with
-  // `values` being either a single string (the value of one row) or the full
-  // array. Both the placeholder row (always one empty input visible) and an
-  // initial "no items" state pass an empty value here, so we cannot enforce
-  // "at least one entry" at this layer without producing false negatives.
-  // Instead we just validate the URL format of any non-empty value and let the
-  // backend gracefully no-op when the section has no URLs yet.
-  o.validate = function (section_id, values) {
-    if (values == null) return true;
-    const list = Array.isArray(values) ? values : [values];
-    for (let i = 0; i < list.length; i++) {
-      const url = String(list[i] || "").trim();
-      if (url.length === 0) continue;
-      const v = main.validateUrl(url);
-      if (!v.valid) return v.message;
+  o.rows = 4;
+  o.wrap = "off";
+  // Render textarea as plain text (don't mask) — URLs are not secrets in the
+  // OpenWrt context (rooted UCI is already readable). Masking caused users to
+  // paste-and-forget when the value was hidden.
+
+  // Marshal between textarea (single string with newlines) and UCI list.
+  o.cfgvalue = function (section_id) {
+    let v = uci.get("podkop", section_id, "subscription_urls");
+    if (v == null) {
+      // Fallback: legacy single-URL field. Show it inside the textarea so the
+      // user can see and edit their existing URL even before migration runs.
+      const legacy = uci.get("podkop", section_id, "subscription_url");
+      return legacy != null ? String(legacy) : "";
+    }
+    if (Array.isArray(v)) return v.join("\n");
+    return String(v);
+  };
+  o.write = function (section_id, value) {
+    const lines = String(value || "")
+      .split(/\r?\n/)
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+    uci.set("podkop", section_id, "subscription_urls", lines);
+    // Drop the legacy single-URL field once the user has populated the new
+    // list — keeps the config clean and avoids ambiguity for the backend.
+    uci.unset("podkop", section_id, "subscription_url");
+  };
+  o.remove = function (section_id) {
+    uci.unset("podkop", section_id, "subscription_urls");
+    uci.unset("podkop", section_id, "subscription_url");
+  };
+  o.validate = function (section_id, value) {
+    const lines = String(value || "")
+      .split(/\r?\n/)
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+    for (let i = 0; i < lines.length; i++) {
+      const v = main.validateUrl(lines[i]);
+      if (!v.valid) return v.message + " — " + lines[i];
     }
     return true;
-  };
-
-  // Legacy single-URL field — hidden but still functional. The backend reads
-  // it transparently; we keep it visible for one release so users can see
-  // their existing URL in case migration hasn't run yet.
-  o = section.option(
-    form.Value,
-    "subscription_url",
-    _("Subscription URL (legacy, single)"),
-    _(
-      "Legacy single-URL field. Prefer 'Subscription URLs' above (multiple). " +
-        "This field is kept for backwards compatibility and will be migrated " +
-        "automatically.",
-    ),
-  );
-  o.depends("proxy_config_type", "subscription");
-  o.password = true;
-  o.optional = true;
-  o.rmempty = true;
-  o.validate = function (section_id, value) {
-    if (!value || value.length === 0) return true;
-    const v = main.validateUrl(value);
-    return v.valid ? true : v.message;
   };
 
   o = section.option(
@@ -493,12 +499,29 @@ function createSectionContent(section) {
   o.inputstyle = "apply";
   o.onclick = function (ev, section_id) {
     const btn = ev.currentTarget;
+    const restoreBtn = function () {
+      btn.disabled = false;
+      btn.innerHTML = _("Update subscription now");
+    };
     btn.disabled = true;
-    btn.innerHTML = _("Updating…");
-    return fs
-      .exec("/usr/bin/podkop", ["subscription_update", section_id])
+    btn.innerHTML = _("Saving…");
+    // First persist any pending edits the user has made (especially the
+    // Subscription URLs textarea), then commit UCI, then call the CLI. Without
+    // this, clicking Update before Save & Apply runs against an empty config.
+    return this.map
+      .save(null, true)
+      .then(function () {
+        return fs.exec("/sbin/uci", ["commit", "podkop"]);
+      })
+      .then(function () {
+        btn.innerHTML = _("Updating…");
+        return fs.exec("/usr/bin/podkop", [
+          "subscription_update",
+          section_id,
+        ]);
+      })
       .then(function (res) {
-        if (res.code === 0) {
+        if (res && res.code === 0) {
           ui.addNotification(
             null,
             E(
@@ -508,15 +531,29 @@ function createSectionContent(section) {
             ),
             "info",
           );
-        } else {
+        } else if (res && res.code === 2) {
           ui.addNotification(
             null,
             E(
               "p",
               {},
               _(
-                "Subscription '%s' update failed (exit=%d). See system log.",
-              ).format(section_id, res.code || -1),
+                "Subscription '%s': no URLs configured. Add at least one URL to the field above and click Save & Apply.",
+              ).format(section_id),
+            ),
+            "warning",
+          );
+        } else {
+          const code = res && res.code != null ? res.code : -1;
+          const stderr = (res && res.stderr) || "";
+          ui.addNotification(
+            null,
+            E(
+              "p",
+              {},
+              _(
+                "Subscription '%s' update failed (exit=%d). See system log. %s",
+              ).format(section_id, code, stderr),
             ),
             "danger",
           );
@@ -529,10 +566,7 @@ function createSectionContent(section) {
           "danger",
         );
       })
-      .finally(function () {
-        btn.disabled = false;
-        btn.innerHTML = _("Update subscription now");
-      });
+      .finally(restoreBtn);
   };
 
   o = section.option(

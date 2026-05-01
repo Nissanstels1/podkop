@@ -3091,18 +3091,37 @@ subscription_update_cli() {
     # Per-section refresh: fetch + parse, decide if anything material changed.
     _refresh_one() {
         local section="$1"
-        local prev_sha="" new_sha=""
+        local prev_sha="" new_sha="" sec_rc=0
+        local urls url_count
+
+        # Skip silently if the section has no configured URLs at all — running
+        # subscription_update_section would just return 2. Caller will see "no
+        # URLs configured" instead of the misleading "upstream unchanged".
+        urls="$(subscription_collect_urls "$section" 2>/dev/null)"
+        url_count="$(printf '%s' "$urls" | grep -c '.' 2>/dev/null || true)"
+        if [ -z "$url_count" ] || [ "$url_count" = "0" ]; then
+            log "subscription[$section]: no URLs configured, skipping" "warn"
+            rc=2
+            return
+        fi
 
         # Read the previous body sha BEFORE update_section overwrites the meta.
         prev_sha="$(subscription_meta_read "$(subscription_cache_path_meta "$section")" \
                     | awk -F'\t' '{print $5}')"
 
-        subscription_update_section "$section" || rc=1
+        if subscription_update_section "$section"; then
+            sec_rc=0
+        else
+            sec_rc=$?
+            rc=1
+        fi
 
         new_sha="$(subscription_meta_read "$(subscription_cache_path_meta "$section")" \
                    | awk -F'\t' '{print $5}')"
 
-        if [ -n "$new_sha" ] && [ "$new_sha" != "$prev_sha" ]; then
+        if [ "$sec_rc" -ne 0 ]; then
+            log "subscription[$section]: refresh FAILED (rc=$sec_rc); see preceding errors" "error"
+        elif [ -n "$new_sha" ] && [ "$new_sha" != "$prev_sha" ]; then
             need_reload=1
             log "subscription[$section]: upstream content changed (sha $prev_sha → $new_sha), will reload sing-box"
         else
