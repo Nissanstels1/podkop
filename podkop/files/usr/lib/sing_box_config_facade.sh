@@ -102,6 +102,16 @@ sing_box_cf_add_proxy_outbound() {
         flow=$(url_get_query_param "$url" "flow")
         packet_encoding=$(url_get_query_param "$url" "packetEncoding")
 
+        # sing-box only accepts "" or "xtls-rprx-vision". Some panels publish
+        # vendor-specific variants (e.g. xtls-rprx-vision-udp443, xtls-rprx-direct).
+        # Normalise: collapse the vision family to plain "xtls-rprx-vision";
+        # drop anything else so the outbound still validates.
+        case "$flow" in
+            "" | "none") flow="" ;;
+            xtls-rprx-vision*) flow="xtls-rprx-vision" ;;
+            *) flow="" ;;
+        esac
+
         config=$(sing_box_cm_add_vless_outbound "$config" "$tag" "$host" "$port" "$uuid" "$flow" "" "$packet_encoding")
         config=$(_add_outbound_security "$config" "$tag" "$url")
         config=$(_add_outbound_transport "$config" "$tag" "$url")
@@ -194,6 +204,13 @@ _add_outbound_security() {
         fingerprint=$(url_get_query_param "$url" "fp")
         public_key=$(url_get_query_param "$url" "pbk")
         short_id=$(url_get_query_param "$url" "sid")
+
+        # sing-box >=1.10 mandates uTLS when REALITY is enabled. Many panels
+        # omit fp= because the client picks a default; fall back to "chrome"
+        # so the resulting outbound is accepted by `sing-box check`.
+        if [ "$security" = "reality" ] && [ -z "$fingerprint" ]; then
+            fingerprint="chrome"
+        fi
 
         config=$(
             sing_box_cm_set_tls_for_outbound \
