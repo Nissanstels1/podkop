@@ -718,6 +718,66 @@ subscription_cache_path_raw()     { echo "$SUBSCRIPTION_CACHE_DIR/$1.raw"; }
 subscription_cache_path_parsed()  { echo "$SUBSCRIPTION_CACHE_DIR/$1.parsed"; }
 subscription_cache_path_meta()    { echo "$SUBSCRIPTION_CACHE_DIR/$1.meta"; }
 subscription_cache_path_latency() { echo "$SUBSCRIPTION_CACHE_DIR/$1.latency"; }
+# Stores the sha256 of the filtered profile set that was last applied to the
+# running sing-box config. Used by the update flow to skip a redundant reload
+# when neither the subscription body nor the latency-driven filter outcome
+# would actually change the urltest membership.
+subscription_cache_path_applied() { echo "$SUBSCRIPTION_CACHE_DIR/$1.applied"; }
+
+# Compute a stable hash of "what would currently land in the urltest group
+# for this section". We reuse the exact same filter pipeline as the config
+# build so the signatures are guaranteed to match. Result is the empty string
+# if the parsed cache is missing.
+subscription_compute_filter_signature() {
+    local section="$1"
+    local parsed includes excludes ping_min ping_max latency_file
+
+    parsed="$(subscription_cache_path_parsed "$section")"
+    [ -r "$parsed" ] || { echo ""; return 0; }
+
+    includes="$(subscription_collect_list "$section" "subscription_filters")"
+    excludes="$(subscription_collect_list "$section" "subscription_exclude")"
+    config_get ping_min "$section" "subscription_ping_min" "0"
+    config_get ping_max "$section" "subscription_ping_max" "0"
+    latency_file="$(subscription_cache_path_latency "$section")"
+
+    subscription_apply_filter "$parsed" "$includes" "$excludes" \
+        "$latency_file" "$ping_min" "$ping_max" \
+        | sort \
+        | sha256sum 2>/dev/null \
+        | awk '{print $1}'
+}
+
+subscription_count_filtered() {
+    local section="$1"
+    local parsed includes excludes ping_min ping_max latency_file
+    parsed="$(subscription_cache_path_parsed "$section")"
+    [ -r "$parsed" ] || { echo 0; return 0; }
+    includes="$(subscription_collect_list "$section" "subscription_filters")"
+    excludes="$(subscription_collect_list "$section" "subscription_exclude")"
+    config_get ping_min "$section" "subscription_ping_min" "0"
+    config_get ping_max "$section" "subscription_ping_max" "0"
+    latency_file="$(subscription_cache_path_latency "$section")"
+    subscription_apply_filter "$parsed" "$includes" "$excludes" \
+        "$latency_file" "$ping_min" "$ping_max" \
+        | sed '/^$/d' \
+        | wc -l \
+        | tr -d ' '
+}
+
+subscription_read_applied_signature() {
+    local section="$1"
+    local f
+    f="$(subscription_cache_path_applied "$section")"
+    [ -r "$f" ] && cat "$f" || echo ""
+}
+
+subscription_write_applied_signature() {
+    local section="$1"
+    local sig="$2"
+    [ -z "$sig" ] && return 0
+    printf '%s\n' "$sig" > "$(subscription_cache_path_applied "$section")"
+}
 
 subscription_cache_init() {
     [ -d "$SUBSCRIPTION_CACHE_DIR" ] || mkdir -p "$SUBSCRIPTION_CACHE_DIR"

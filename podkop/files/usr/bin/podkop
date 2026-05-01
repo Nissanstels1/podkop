@@ -533,13 +533,13 @@ subscription_remove_cron_jobs() {
 
 subscription_add_cron_job() {
     local section="$1"
-    local subscription_update_interval cron_expr cron_line latency_cron pool_cron \
+    local subscription_update_interval cron_expr cron_line pool_cron \
         sub_urls_count effective_interval prev_meta tier streak
 
     sub_urls_count="$(subscription_collect_urls "$section" | grep -c '.' || true)"
     [ -z "$sub_urls_count" ] || [ "$sub_urls_count" = "0" ] && return 0
 
-    config_get subscription_update_interval "$section" "subscription_update_interval" "1h"
+    config_get subscription_update_interval "$section" "subscription_update_interval" "1d"
 
     # If "auto", derive the active tier from cached meta. Falls back to 1h.
     case "$subscription_update_interval" in
@@ -572,20 +572,15 @@ subscription_add_cron_job() {
 
     cron_line="$cron_expr /usr/bin/podkop subscription_update $section # podkop-subscription:$section"
 
-    # Latency collector: every 5 minutes when ping-range or pool-split features
-    # are actually used. Otherwise skip — sing-box has its own urltest.
-    local ping_min ping_max pool_split
-    config_get ping_min   "$section" "subscription_ping_min"  "0"
-    config_get ping_max   "$section" "subscription_ping_max"  "0"
+    # Latency probing now happens INSIDE subscription_update_cli (synchronously,
+    # right after fetch+reload) so the ping-range filter and fast/slow split
+    # apply in the same cycle the new profiles arrive. No separate cron needed.
+    local pool_split
     config_get pool_split "$section" "subscription_pool_split" "0"
-    latency_cron=""
-    if [ "$pool_split" = "1" ] || \
-       { [ -n "$ping_min" ] && [ "$ping_min" != "0" ]; } || \
-       { [ -n "$ping_max" ] && [ "$ping_max" != "0" ]; }; then
-        latency_cron="*/5 * * * * /usr/bin/podkop subscription_collect_latency $section # podkop-subscription:$section"
-    fi
 
-    # Pool watchdog: every minute, only when pool-split is on.
+    # Pool watchdog: every minute, only when pool-split is on. This is a
+    # liveness check (is the fast pool dead right now?), independent of the
+    # update flow.
     pool_cron=""
     if [ "$pool_split" = "1" ]; then
         pool_cron="* * * * * /usr/bin/podkop subscription_pool_watchdog $section # podkop-subscription:$section"
@@ -598,11 +593,10 @@ subscription_add_cron_job() {
     {
         crontab -l 2>/dev/null
         echo "$cron_line"
-        [ -n "$latency_cron" ] && echo "$latency_cron"
         [ -n "$pool_cron" ]    && echo "$pool_cron"
     } | crontab -
 
-    log "subscription[$section]: cron set ($cron_expr$( [ -n "$latency_cron" ] && echo '; +latency'; [ -n "$pool_cron" ] && echo '; +watchdog'))"
+    log "subscription[$section]: cron set ($cron_expr$( [ -n "$pool_cron" ] && echo '; +watchdog'))"
 }
 
 subscription_install_all_cron_jobs() {
@@ -3004,36 +2998,152 @@ global_check() {
     fi
 }
 
+# Returns 0 if the section's filter or fast/slow split needs a fresh latency
+# cache to be useful. When this returns non-zero we skip the synchronous probe
+# entirely — sing-box's own internal urltest already picks the lowest-RTT
+# member, which is the user's "filter disabled = shortest ping wins" behaviour.
+subscription_section_needs_latency() {
+    local section="$1"
+    local pmin pmax pool_split
+    config_get pmin       "$section" "subscription_ping_min"  "0"
+    config_get pmax       "$section" "subscription_ping_max"  "0"
+    config_get pool_split "$section" "subscription_pool_split" "0"
+
+    [ "$pool_split" = "1" ] && return 0
+    [ -n "$pmin" ] && [ "$pmin" != "0" ] && return 0
+    [ -n "$pmax" ] && [ "$pmax" != "0" ] && return 0
+    return 1
+}
+
+# Wait until sing-box's Clash API is responsive after a reload. Returns 0 once
+# /proxies replies with a JSON object (i.e. the urltest groups are usable),
+# 1 if it never comes up within the timeout. Quick and quiet — this runs as
+# part of every scheduled subscription update.
+subscription_wait_clash_api_ready() {
+    local timeout="${1:-15}"
+    local i=0
+    while [ "$i" -lt "$timeout" ]; do
+        if clash_api get_proxies 2>/dev/null | jq -e 'type == "object"' >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    return 1
+}
+
+# Top-level CLI entry — designed for seamless updates.
+#
+# Per call we trigger AT MOST ONE sing-box reload — and only when the
+# subscription body genuinely changed (sha256 of upstream content differs).
+# A scheduled update at "1d" interval that fetches an unchanged feed is
+# completely transparent: sing-box runs uninterrupted.
+#
+# Latency probing (for ping-range / fast-slow split) runs after the optional
+# reload, in the background relative to user traffic. The freshly-measured
+# latencies feed the NEXT update cycle's filter — there is no second reload.
+# This is the trade-off: filter changes propagate one cycle late, but the
+# user never sees a connection blip in exchange.
+#
+# The pool watchdog (1-minute cron) handles the "selected profile died"
+# case by switching the user-facing selector via Clash API at runtime,
+# without any config rebuild.
 subscription_update_cli() {
     local target="$1"
-    local rc=0 any=0
+    local rc=0 any=0 need_reload=0
+
+    # Per-section refresh: fetch + parse, decide if anything material changed.
+    _refresh_one() {
+        local section="$1"
+        local prev_sha="" new_sha=""
+
+        # Read the previous body sha BEFORE update_section overwrites the meta.
+        prev_sha="$(subscription_meta_read "$(subscription_cache_path_meta "$section")" \
+                    | awk -F'\t' '{print $5}')"
+
+        subscription_update_section "$section" || rc=1
+
+        new_sha="$(subscription_meta_read "$(subscription_cache_path_meta "$section")" \
+                   | awk -F'\t' '{print $5}')"
+
+        if [ -n "$new_sha" ] && [ "$new_sha" != "$prev_sha" ]; then
+            need_reload=1
+            log "subscription[$section]: upstream content changed (sha $prev_sha → $new_sha), will reload sing-box"
+        else
+            log "subscription[$section]: upstream content unchanged, sing-box stays running"
+        fi
+    }
 
     if [ -n "$target" ]; then
-        subscription_update_section "$target"
-        rc=$?
-        # Reload sing-box so the new outbound list takes effect.
-        if [ "$rc" -eq 0 ]; then
-            log "subscription[$target]: reloading sing-box"
-            reload >/dev/null 2>&1 || /etc/init.d/sing-box reload >/dev/null 2>&1 || true
-        fi
-        return "$rc"
-    fi
-
-    # No target — refresh every section that has any subscription URL set.
-    _do_one() {
-        local section="$1"
-        local n
-        n="$(subscription_collect_urls "$section" | grep -c '.' || true)"
-        [ -z "$n" ] || [ "$n" = "0" ] && return 0
         any=1
-        subscription_update_section "$section" || rc=1
-    }
-    config_foreach _do_one "section"
-
-    if [ "$any" -eq 1 ] && [ "$rc" -eq 0 ]; then
-        log "subscription: reloading sing-box"
-        reload >/dev/null 2>&1 || /etc/init.d/sing-box reload >/dev/null 2>&1 || true
+        _refresh_one "$target"
+    else
+        _do_one_refresh() {
+            local section="$1"
+            local n
+            n="$(subscription_collect_urls "$section" | grep -c '.' || true)"
+            [ -z "$n" ] || [ "$n" = "0" ] && return 0
+            any=1
+            _refresh_one "$section"
+        }
+        config_foreach _do_one_refresh "section"
     fi
+
+    [ "$any" -eq 1 ] || return "$rc"
+
+    # Single reload — only when at least one section's upstream actually changed.
+    if [ "$rc" -eq 0 ] && [ "$need_reload" -eq 1 ]; then
+        log "subscription: reloading sing-box (subscription body changed)"
+        reload >/dev/null 2>&1 || /etc/init.d/sing-box reload >/dev/null 2>&1 || true
+        _persist_sig() {
+            local section="$1"
+            local sig
+            sig="$(subscription_compute_filter_signature "$section")"
+            subscription_write_applied_signature "$section" "$sig"
+        }
+        if [ -n "$target" ]; then
+            _persist_sig "$target"
+        else
+            config_foreach _persist_sig "section"
+        fi
+    fi
+
+    # Background latency probe (no reload). Refreshes the cache so the NEXT
+    # update cycle's filter has fresh data. Skipped if no section needs it.
+    if [ "$rc" -eq 0 ]; then
+        local any_needs=0
+        _check_needs() {
+            subscription_section_needs_latency "$1" && any_needs=1
+        }
+        if [ -n "$target" ]; then
+            _check_needs "$target"
+        else
+            config_foreach _check_needs "section"
+        fi
+
+        if [ "$any_needs" -eq 1 ]; then
+            if subscription_wait_clash_api_ready 15; then
+                _probe_one() {
+                    local section="$1"
+                    local n
+                    n="$(subscription_collect_urls "$section" | grep -c '.' || true)"
+                    [ -z "$n" ] || [ "$n" = "0" ] && return 0
+                    subscription_section_needs_latency "$section" || return 0
+                    log "subscription[$section]: refreshing latency cache (no reload)"
+                    subscription_collect_latency_cli "$section" >/dev/null 2>&1 || \
+                        log "subscription[$section]: latency probe failed" "warn"
+                }
+                if [ -n "$target" ]; then
+                    _probe_one "$target"
+                else
+                    config_foreach _probe_one "section"
+                fi
+            else
+                log "subscription: Clash API not ready, skipping latency refresh; pool watchdog will catch dead profiles" "warn"
+            fi
+        fi
+    fi
+
     return "$rc"
 }
 

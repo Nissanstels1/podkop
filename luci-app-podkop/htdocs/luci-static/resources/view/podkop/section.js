@@ -364,9 +364,9 @@ function createSectionContent(section) {
   o.value("10m", _("Every 10 minutes"));
   o.value("1h", _("Every hour"));
   o.value("6h", _("Every 6 hours"));
-  o.value("1d", _("Once a day"));
+  o.value("1d", _("Once a day (recommended)"));
   o.value("off", _("Disabled (manual only)"));
-  o.default = "1h";
+  o.default = "1d";
   o.depends("proxy_config_type", "subscription");
 
   o = section.option(

@@ -320,6 +320,38 @@ SUBSCRIPTION_CACHE_DIR="$WORK"
 [ "$(subscription_cache_path_parsed foo)"  = "$WORK/foo.parsed" ]  && ok "parsed path" || nope ""
 [ "$(subscription_cache_path_meta foo)"    = "$WORK/foo.meta" ]    && ok "meta path" || nope ""
 [ "$(subscription_cache_path_latency foo)" = "$WORK/foo.latency" ] && ok "latency path" || nope ""
+[ "$(subscription_cache_path_applied foo)" = "$WORK/foo.applied" ] && ok "applied path" || nope ""
+
+echo "=== Test 38b: filter signature is stable + applied I/O round-trip ==="
+SUBSCRIPTION_CACHE_DIR="$WORK"
+cat > "$WORK/sec38.parsed" <<'EOF'
+url vless://u@a:1#NL
+url vless://u@b:2#RU
+url vless://u@c:3#DE
+EOF
+cat > "$WORK/sec38.latency" <<'EOF'
+NL	350
+RU	100
+DE	450
+EOF
+_uci_sec38_subscription_filters=""
+_uci_sec38_subscription_exclude=""
+_uci_sec38_subscription_ping_min="300"
+_uci_sec38_subscription_ping_max="500"
+
+sig1="$(subscription_compute_filter_signature sec38)"
+sig2="$(subscription_compute_filter_signature sec38)"
+[ -n "$sig1" ] && ok "signature non-empty" || nope "got empty"
+[ "$sig1" = "$sig2" ] && ok "signature stable across calls" || nope "$sig1 != $sig2"
+
+# Round-trip persisted signature.
+subscription_write_applied_signature sec38 "$sig1"
+[ "$(subscription_read_applied_signature sec38)" = "$sig1" ] && ok "applied I/O round-trip" || nope ""
+
+# Loosening the filter must change the signature (DE included now stays, RU now passes).
+_uci_sec38_subscription_ping_min="0"
+sig3="$(subscription_compute_filter_signature sec38)"
+[ "$sig3" != "$sig1" ] && ok "filter widening changes signature" || nope "sig3=$sig3"
 
 echo "=== Test 39: Clash YAML parsing (skipped if python3-yaml absent) ==="
 if python3 -c 'import yaml' 2>/dev/null; then
