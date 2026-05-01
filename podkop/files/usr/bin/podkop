@@ -229,6 +229,42 @@ restart() {
 # Migrations and validation funcs
 migration() {
     config_foreach _migrate_subscription_url_to_list "section"
+    # After legacy migration, also detect URL-set changes and pre-fetch so
+    # that adding a new subscription URL via LuCI / uci translates into a
+    # working sing-box config on the very first start_main cycle (no need
+    # to wait for cron or to click "Update subscription now").
+    config_foreach _refresh_subscription_on_url_change "section"
+}
+
+# v2: when the configured `subscription_urls` list (sha-256 of joined URLs)
+# differs from the snapshot saved alongside the parsed cache, perform a
+# synchronous fetch+parse before sing-box config is built. The signature
+# is then persisted so subsequent reloads do not refetch unnecessarily.
+_refresh_subscription_on_url_change() {
+    local section="$1"
+    local proxy_config_type urls url_count cur_sha prev_sha sig_file
+
+    config_get proxy_config_type "$section" "proxy_config_type"
+    [ "$proxy_config_type" = "subscription" ] || return 0
+
+    urls="$(subscription_collect_urls "$section" 2>/dev/null)"
+    url_count="$(printf '%s' "$urls" | grep -c '.' 2>/dev/null || true)"
+    [ -z "$url_count" ] || [ "$url_count" = "0" ] && return 0
+
+    sig_file="$(subscription_cache_path_meta "$section").urls"
+    cur_sha="$(printf '%s' "$urls" | sha256sum 2>/dev/null | awk '{print $1}')"
+    prev_sha=""
+    [ -r "$sig_file" ] && prev_sha="$(cat "$sig_file" 2>/dev/null)"
+
+    if [ "$cur_sha" != "$prev_sha" ]; then
+        log "subscription[$section]: URL set changed, fetching now (was=$prev_sha new=$cur_sha)" "info"
+        if subscription_update_section "$section" 2>/dev/null; then
+            mkdir -p "$(dirname "$sig_file")" 2>/dev/null
+            printf '%s' "$cur_sha" > "$sig_file"
+        else
+            log "subscription[$section]: pre-start fetch failed; will retry via cron" "warn"
+        fi
+    fi
 }
 
 # v2 migration: legacy `option subscription_url` (single Value) is replaced

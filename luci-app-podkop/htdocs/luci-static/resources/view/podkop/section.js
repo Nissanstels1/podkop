@@ -235,25 +235,21 @@ function createSectionContent(section) {
   o.depends("proxy_config_type", "subscription");
   o.placeholder = "https://panel.example.com/sub/abc";
   o.password = true;
+  // LuCI's DynamicList invokes this validator per-row as the user types, with
+  // `values` being either a single string (the value of one row) or the full
+  // array. Both the placeholder row (always one empty input visible) and an
+  // initial "no items" state pass an empty value here, so we cannot enforce
+  // "at least one entry" at this layer without producing false negatives.
+  // Instead we just validate the URL format of any non-empty value and let the
+  // backend gracefully no-op when the section has no URLs yet.
   o.validate = function (section_id, values) {
-    if (!values || (Array.isArray(values) && values.length === 0)) {
-      // Allow empty if the legacy single field still has a value (handled below).
-      const legacy = uci.get("podkop", section_id, "subscription_url");
-      if (legacy && String(legacy).length > 0) return true;
-      return _("At least one Subscription URL is required");
-    }
+    if (values == null) return true;
     const list = Array.isArray(values) ? values : [values];
-    let httpFound = false;
     for (let i = 0; i < list.length; i++) {
       const url = String(list[i] || "").trim();
       if (url.length === 0) continue;
       const v = main.validateUrl(url);
       if (!v.valid) return v.message;
-      if (/^http:\/\//i.test(url)) httpFound = true;
-    }
-    if (httpFound) {
-      // Non-fatal: the validator should return true to accept the value, the
-      // warning is rendered via a separate help row below.
     }
     return true;
   };

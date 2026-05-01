@@ -943,3 +943,214 @@ msgstr "Секретный ключ YACD"
 
 msgid "You can select Output Network Interface, by default autodetect"
 msgstr "Вы можете выбрать выходной сетевой интерфейс, по умолчанию он определяется автоматически."
+
+# v2: Subscription URLs (multi-source) ===================================
+
+msgid "Subscription URLs"
+msgstr "Ссылки на подписки"
+
+msgid "One or more HTTP(S) URLs to fetch. Supported formats: sing-box JSON, Clash YAML, v2ray JSON, base64-encoded link lists, or plain link lists. All sources are merged and deduplicated by tag+endpoint. Use http:// only for trusted local panels — a warning will be shown."
+msgstr ""
+"Одна или несколько HTTP(S) ссылок, по которым будет скачиваться подписка. "
+"Можно добавлять по одной — нажмите «+» и вставьте ссылку. Если вы добавите "
+"несколько ссылок (от разных провайдеров), профили будут объединены в общий "
+"пул, а дубли (по тегу + сервер:порт) удалены автоматически.\n\n"
+"Поддерживаемые форматы:\n"
+"  • Список ссылок vless://, ss://, trojan://, hy2:// (по одной в строке)\n"
+"  • Тот же список, закодированный в base64 (как у большинства панелей)\n"
+"  • Clash / clash.meta YAML (требуется пакет python3-yaml)\n"
+"  • v2ray JSON (с полем outbounds)\n"
+"  • Полный sing-box JSON\n\n"
+"Формат определяется автоматически. Используйте http:// только для проверенных "
+"локальных панелей — предупреждение будет показано в логе.\n\n"
+"Пример: https://my-panel.example.com/sub/abcdef"
+
+msgid "Subscription URL (legacy, single)"
+msgstr "Ссылка на подписку (старое поле)"
+
+msgid "Legacy single-URL field. Prefer 'Subscription URLs' above (multiple). This field is kept for backwards compatibility and will be migrated automatically."
+msgstr ""
+"Старое поле для одиночной ссылки. Используйте «Ссылки на подписки» сверху — "
+"оно поддерживает несколько источников. Это поле сохранено для совместимости "
+"и значение из него будет перенесено в новый список автоматически при первом "
+"запуске."
+
+msgid "How to interpret the subscription body. 'auto' detects sing-box JSON, Clash YAML, v2ray JSON, base64 or plain link list automatically. Only override if auto-detection picks the wrong format."
+msgstr ""
+"Как читать тело подписки. «Автоопределение» обычно работает: сначала "
+"проверяется sing-box JSON, потом v2ray JSON, потом Clash YAML, потом base64, "
+"и в конце plain (список ссылок). Меняйте только если автоопределение "
+"ошиблось — это видно в журнале (logread -e podkop)."
+
+msgid "Auto-detect (recommended)"
+msgstr "Автоопределение (рекомендуется)"
+
+msgid "Clash / clash.meta YAML"
+msgstr "Clash / clash.meta YAML"
+
+msgid "v2ray JSON"
+msgstr "v2ray JSON"
+
+# v2: Auto-update interval & smart tiering ===============================
+
+msgid "How often the subscription is refreshed in the background. On every successful refresh sing-box is reloaded. 'Auto (smart)' adapts: 7 unchanged updates in a row → bump tier coarser (10m → 1h → 6h → 1d); any change → tighten one tier. Cuts panel load when nothing changes."
+msgstr ""
+"Как часто podkop сам идёт за подпиской. На каждое УСПЕШНОЕ обновление, "
+"при котором содержимое реально изменилось, sing-box перезагружается ОДИН раз. "
+"Если содержимое не изменилось — sing-box работает без перезапуска "
+"(не будет «дёрганий» интернета).\n\n"
+"Большинство пользователей хочет «Раз в сутки» — этого достаточно, "
+"подписки редко меняются чаще.\n\n"
+"«Авто (адаптивно)» — экспериментальный режим: после 7 одинаковых "
+"обновлений подряд тир замедляется (10 мин → 1 час → 6 часов → 1 день), "
+"при любом изменении тир ускоряется на один шаг назад. Уменьшает нагрузку "
+"на панель провайдера, когда ничего не меняется."
+
+msgid "Auto (smart adaptive)"
+msgstr "Авто (адаптивно)"
+
+msgid "Once a day (recommended)"
+msgstr "Раз в сутки (рекомендуется)"
+
+# v2: Latency-range filter ===============================================
+
+msgid "Min Latency (ms)"
+msgstr "Минимальный пинг (мс)"
+
+msgid "Drop profiles faster than this latency. Useful to exclude in-country servers when you specifically want servers abroad. 0 = no lower bound. Latency values are populated by the background latency collector."
+msgstr ""
+"Профили с пингом МЕНЬШЕ этого значения отбрасываются (не попадают в "
+"автовыбор). Используется когда нужно исключить близкие серверы.\n\n"
+"Пример: в подписке 1500 профилей, среди них есть российские с пингом "
+"50–80 мс — они всегда выигрывают по скорости и выбираются автоматически. "
+"Но вам нужен иностранный (например, для обхода блокировок). Поставьте "
+"«Минимальный пинг = 200» — все российские отвалятся, и автовыбор "
+"переключится на иностранные.\n\n"
+"0 = ограничения снизу нет. Значения пинга подскажет встроенный сборщик "
+"(работает при наличии включённого Clash API в sing-box)."
+
+msgid "Max Latency (ms)"
+msgstr "Максимальный пинг (мс)"
+
+msgid "Drop profiles slower than this latency. 0 = no upper bound. Profiles without a measurement yet are kept (so a brand new subscription still has working entries while measurements accumulate)."
+msgstr ""
+"Профили с пингом БОЛЬШЕ этого значения отбрасываются. 0 = ограничения "
+"сверху нет.\n\n"
+"Пример: «Максимальный пинг = 500» отбросит все серверы, до которых "
+"пинг больше полусекунды — они всё равно бы тормозили.\n\n"
+"Свежедобавленные профили без измеренного пинга НЕ отбрасываются — "
+"чтобы только что подключённая подписка сразу работала, пока копятся "
+"измерения. Через несколько минут (когда сборщик пингов отработает) "
+"фильтр применится полностью.\n\n"
+"Типовой сценарий «только зарубежные не очень медленные»: "
+"Минимальный = 200, Максимальный = 500."
+
+# v2: Fast/slow pool split ==============================================
+
+msgid "Split into fast / slow pools"
+msgstr "Разделять на быстрый/медленный пулы"
+
+msgid "Build TWO urltest groups: <section>-fast (latency < threshold) and <section>-slow (the rest). Selector defaults to fast; a watchdog auto-switches to slow when every fast profile is dead and back to fast on recovery. Recommended for big subscriptions where some regions are flaky."
+msgstr ""
+"podkop создаст ДВЕ группы urltest: «-fast» (пинг < порога) и «-slow» "
+"(остальные). По умолчанию используется быстрый пул. Раз в минуту "
+"watchdog проверяет: если ВСЕ профили в быстром пуле умерли — "
+"переключает на медленный (через Clash API, без перезапуска sing-box). "
+"Когда хоть один быстрый профиль оживёт — переключение обратно "
+"автоматическое.\n\n"
+"Полезно для больших подписок (1000+ профилей) с серверами в разных "
+"странах: основной трафик идёт через быстрые, но если они все упадут "
+"(например, провайдер их временно отключил) — интернет не пропадёт, "
+"трафик переедет на медленные. Без перезагрузки и без обрыва "
+"соединений."
+
+msgid "Fast pool threshold (ms)"
+msgstr "Порог быстрого пула (мс)"
+
+msgid "Profiles with latency < threshold go into the fast pool, the rest into the slow pool. Default 100 ms."
+msgstr ""
+"Профили с пингом меньше этого значения попадают в быстрый пул, "
+"остальные — в медленный. По умолчанию 100 мс. Для дальних серверов "
+"можно поднять до 200–300 мс."
+
+# v2: DNS-over-proxy ====================================================
+
+msgid "DNS over proxy (per-section)"
+msgstr "DNS через прокси (для секции)"
+
+msgid "Resolve the listed domains through the proxy by default, falling back to the local resolver if the proxy DNS times out. Useful to avoid leaking sensitive resolutions to your ISP. Opt-in."
+msgstr ""
+"Резолвить указанные ниже домены ЧЕРЕЗ прокси (а не через DNS-сервер "
+"провайдера). Если прокси DNS не ответит за указанный таймаут — "
+"возврат к локальному резолверу.\n\n"
+"Зачем нужно: ваш интернет-провайдер видит, к каким сайтам вы "
+"обращаетесь — даже если трафик идёт через VPN, DNS-запросы могут "
+"идти открытым текстом. Этот режим закрывает дырку для перечисленных "
+"доменов.\n\n"
+"По умолчанию выключено."
+
+msgid "DNS-over-proxy domains"
+msgstr "Домены для DNS через прокси"
+
+msgid "Domains to resolve through the proxy (one per row). Subdomains are matched automatically. Example: chatgpt.com, openai.com, *.youtube.com."
+msgstr ""
+"Список доменов, для которых DNS-запросы пойдут через прокси. По "
+"одному домену в строке. Поддомены подцепятся автоматически.\n\n"
+"Примеры:\n"
+"  chatgpt.com    (и все *.chatgpt.com)\n"
+"  openai.com\n"
+"  youtube.com\n"
+"  duckduckgo.com\n\n"
+"Не нужно перечислять все мелкие сайты — только те, где DNS-leak "
+"критичен."
+
+msgid "DNS-over-proxy timeout (ms)"
+msgstr "Таймаут DNS через прокси (мс)"
+
+msgid "Fall back to the local resolver if the proxy DNS does not answer within this many milliseconds."
+msgstr ""
+"Если прокси DNS не ответил за указанное число миллисекунд — запрос "
+"перенаправляется на локальный (быстрый) резолвер. По умолчанию "
+"2000 мс — компромисс между скоростью и приватностью."
+
+# v2: Profiles browser additions ========================================
+
+msgid "Latency"
+msgstr "Пинг"
+
+msgid "Pool"
+msgstr "Пул"
+
+msgid "Tier: %s (streak %s)"
+msgstr "Тир: %s (серия: %s)"
+
+msgid "Sources: %s"
+msgstr "Источников: %s"
+
+msgid "Fast pool:"
+msgstr "Быстрый пул:"
+
+msgid "Slow pool:"
+msgstr "Медленный пул:"
+
+msgid "Refresh latency cache"
+msgstr "Обновить кэш пинга"
+
+msgid "Re-poll the Clash API for current latency of every profile and re-apply the ping-range filter / pool split."
+msgstr ""
+"Заново опросить Clash API о пинге каждого профиля и применить фильтр "
+"диапазона / разделение на быстрый/медленный пул. Полезно сразу после "
+"добавления новой подписки или изменения фильтра."
+
+msgid "Refreshing…"
+msgstr "Обновляем…"
+
+msgid "Latency cache refreshed for '%s'."
+msgstr "Кэш пинга обновлён для секции «%s»."
+
+msgid "Latency refresh failed (exit=%d). Is sing-box running and Clash API enabled?"
+msgstr ""
+"Не удалось обновить кэш пинга (код выхода=%d). Запущен ли sing-box и "
+"включено ли Clash API?"
+
+# v2: Subscription update button diagnostics already defined above
